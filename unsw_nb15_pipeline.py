@@ -440,14 +440,7 @@ def main():
         _stage("Running preprocessing (once for all models)")
         _cached_data = preprocess_and_cache(cfg)
 
-        # Enhanced features retimi (Gerekiyorsa)
-        if run_all or args.prep_only:
-            try:
-                from feature_engineering_fixed import run_feature_engineering_pipeline
-                run_feature_engineering_pipeline(cfg, n_features=args.n_features, method='enhanced')
-            except ImportError:
-                _info("feature_engineering_fixed modl bulunamad, orijinal cache ile devam ediliyor.")
-        
+        # We are sticking to the original 36 features to prevent bloat and save RAM.
         _cached_data_orig = _cached_data  # Orijinal veri (36)
 
     # === MODELLER ICIN FARKLI VERI KELERI HAZIRLA ===
@@ -513,13 +506,9 @@ def main():
             _info(f"HistGB model run failed: {e}")
 
     # 2.8 Level-1 / DOS RF Expert - NEW specialized model
-    if run_all or args.run_fast_experts: # DOS expert'i fast expert admna dahil ediyoruz
-        try:
-            from dos_rf_expert import train_dos_expert
-            _info("Running Specialized DOS RF Expert (Enhanced)...")
-            train_dos_expert(cfg.cache_dir, n_features=args.n_features)
-        except Exception as e:
-            _info(f"DOS RF Expert failed: {e}")
+    if run_all or args.run_fast_experts: 
+        _info("Skipping old DOS RF Expert (RandomForest was too heavy). Handled by Fast Binary Experts.")
+        pass
             
     # 3. Level-1 / MLP (OOF) - ENHANCED (58) FEATURES
     if run_all or args.run_mlp:
@@ -536,11 +525,8 @@ def main():
 
     # 5. Level-1 / Uzman Modeller (Focal Loss + SelectKBest + OOF) (Eski Algoritma)
     if args.train_experts:
-        if ExpertsCfg is None or train_experts_ovr is None:
-            raise RuntimeError("experts.py import edilemedi")
-        focus = args.focus or ['analysis','backdoor','dos','worms']
-        exp_cfg = ExpertsCfg(cache_dir=cfg.cache_dir, use_gpu=cfg.use_gpu, focus=focus)
-        train_experts_ovr(exp_cfg, n_features=args.n_features)
+        _info("Skipping old legacy experts. Handled by Fast Binary Experts.")
+        pass
 
     # 5.1 Level-1 / Fast Binary Experts (<80% F1 Otomatik Seim)
     if run_all or args.run_fast_experts:
@@ -550,42 +536,9 @@ def main():
         from sklearn.metrics import f1_score
         
         try:
-            # Otomatik <0.80 Filtresi
-            focus_classes = args.focus
-            if not focus_classes:
-                _info("Auto-determining weak classes (<0.80 F1) from LightGBM original OOF predictions...")
-                
-                lgbm_oof_path = Path(cfg.cache_dir) / 'proba_lgbm_oof_valid.npz'
-                y_v_path = Path(cfg.cache_dir) / 'y_v.joblib'
-                le_path = Path(cfg.cache_dir) / 'label_encoder.joblib'
-                
-                if lgbm_oof_path.exists() and y_v_path.exists() and le_path.exists():
-                    lgbm_data = np.load(lgbm_oof_path, allow_pickle=True)
-                    P_lgbm = lgbm_data['proba']
-                    classes = lgbm_data['classes'].astype(str)
-                    
-                    y_v = joblib.load(y_v_path)
-                    le = joblib.load(le_path)
-                    y_v_enc = le.transform(y_v)
-                    yhat_lgbm = P_lgbm.argmax(axis=1)
-                    
-                    focus_classes = []
-                    for i, cls_name in enumerate(classes):
-                        if cls_name == 'normal': continue # Normali uzmanlarda egitmiyoruz
-                        cls_idx = le.transform([cls_name])[0]
-                        # Binary F1 hesapla o snf iin
-                        y_true_bin = (y_v_enc == cls_idx).astype(int)
-                        y_pred_bin = (yhat_lgbm == cls_idx).astype(int)
-                        
-                        f1 = f1_score(y_true_bin, y_pred_bin, zero_division=0)
-                        if f1 < 0.80:
-                            focus_classes.append(cls_name)
-                            _info(f" -> Added {cls_name} to Fast Experts (F1: {f1:.4f} < 0.80)")
-                        else:
-                            _info(f" -> Skipped {cls_name} (F1: {f1:.4f} > 0.80)")
-                else:
-                    _info("LGBM OOF not found! Falling back to default weak classes.")
-                    focus_classes = ['analysis','backdoor','dos','reconnaissance','shellcode','worms']
+            # We explicitly want to attack DoS, Backdoor, and Analysis
+            focus_classes = args.focus or ['dos', 'backdoor', 'analysis']
+            _info(f"Running Fast Binary LightGBM Experts for: {focus_classes}")
             
             if len(focus_classes) > 0:
                 fast_binary_experts(cache_dir=cfg.cache_dir, minority_classes=focus_classes, n_features=args.n_features)

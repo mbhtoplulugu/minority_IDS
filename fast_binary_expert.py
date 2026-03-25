@@ -171,10 +171,10 @@ def fast_binary_experts(cache_dir, minority_classes, n_features=50):
         
         print(f"  Class weights: {{0: {weight_dict[0]:.3f}, 1: {weight_dict[1]:.3f}}}")
         
-        # Her snf iin en iyi modeli bulmak zere geni model havuzu
+        # Her sinif icin en iyi modeli bulmak uzere model havuzu
         models = {}
         
-        # 1. LightGBM (en gl binary classifier)
+        # 1. LightGBM (en guclu binary classifier, RAM dostu)
         if HAS_LGBM:
             scale_pos = weight_dict[1] / max(weight_dict[0], 1e-6)
             models['LightGBM'] = LGBMClassifier(
@@ -202,24 +202,6 @@ def fast_binary_experts(cache_dir, minority_classes, n_features=50):
                 objective='binary:logistic', random_state=42, 
                 n_jobs=-1, verbosity=0, tree_method='hist'
             )
-        
-        # 3. Random Forest
-        if minority_class in ['backdoor', 'worms']:
-            models['RandomForest'] = RandomForestClassifier(
-                n_estimators=300, max_depth=15, min_samples_split=3, min_samples_leaf=1,
-                class_weight=weight_dict, random_state=42, n_jobs=-1
-            )
-        else:
-            models['RandomForest'] = RandomForestClassifier(
-                n_estimators=200, max_depth=12, min_samples_split=10, min_samples_leaf=5,
-                class_weight=weight_dict, random_state=42, n_jobs=-1
-            )
-        
-        # 4. Logistic Regression
-        models['LogisticRegression'] = LogisticRegression(
-            class_weight=weight_dict, C=10.0, max_iter=2000, 
-            solver='liblinear', random_state=42
-        )
         
         best_f1 = 0
         best_model = None
