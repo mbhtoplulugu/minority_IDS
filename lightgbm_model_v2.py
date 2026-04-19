@@ -22,7 +22,7 @@ def run_lgbm_oof_v2(cfg, n_features=50, cached_data=None):
     
     # Optimize: Cache'den ykle, preprocess tekrarlanmasn
     if cached_data is not None:
-        _info("[LGBM V2] Using pre-loaded cached data")
+        _info(f"[LGBM V2] Using pre-loaded cached data with {cached_data[0].shape[1]} features")
         Xt_tr, y_tr, Xt_v, y_v, Xt_te, y_te = cached_data
     else:
         from experts import _load_cache
@@ -74,22 +74,24 @@ def run_lgbm_oof_v2(cfg, n_features=50, cached_data=None):
     test_preds = np.zeros((len(y_te), len(le.classes_)), dtype=np.float32)
     valid_preds = np.zeros((len(y_v), len(le.classes_)), dtype=np.float32)
 
-    # Calculate optimal manual class weights
-    # Or rely on 'balanced' if preferred. Here we give explicit controlled weights.
-    # To avoid 'normal' being completely ignored and 'worms' exploding predictions,
-    # we soften the 'balanced' ratio.
-    weights_dict = {
-        0: 3.0,  # analysis 
-        1: 5.0,  # backdoor
-        2: 1.0,  # dos     
-        3: 1.0,  # exploits
-        4: 1.0,  # fuzzers 
-        5: 1.0,  # generic 
-        6: 0.1,  # normal  
-        7: 1.0,  # reconnaissance
-        8: 5.0,  # shellcode
-        9: 15.0  # worms   
-    }
+    # Calculate dynamic class weights based on current classes
+    unique_y = np.unique(y_tr_arr)
+    # We want to boost minority classes and penalize 'normal'
+    # 'normal' usually maps to index 5 in CICIDS or some other in UNSW
+    # Let's find index for 'normal' and 'generic'
+    normal_idx = -1
+    generic_idx = -1
+    for i, cls_name in enumerate(le.classes_):
+        if str(cls_name).lower() == 'normal': normal_idx = i
+        if str(cls_name).lower() == 'generic': generic_idx = i
+    
+    # Create dynamic weights: Default 1.0, Normal 0.1, others based on scarcity
+    # But for LGBM, 'balanced' often works well too. Let's use a hybrid approach.
+    dynamic_weights = {}
+    for i in range(len(le.classes_)):
+        if i == normal_idx: dynamic_weights[i] = 0.2
+        elif i == generic_idx: dynamic_weights[i] = 1.0
+        else: dynamic_weights[i] = 2.0 # Attack classes
 
     for fold, (trn_idx, val_idx) in enumerate(skf.split(Xt_tr, y_tr_arr)):
         _info(f"LGBM V2 Fold {fold+1}/5 starting...")
@@ -112,7 +114,7 @@ def run_lgbm_oof_v2(cfg, n_features=50, cached_data=None):
             colsample_bytree=0.8,
             verbose=-1,
             objective='multiclass',
-            class_weight=weights_dict
+            class_weight=dynamic_weights
         )
         
         # Standard fit without custom objective
@@ -142,7 +144,7 @@ def run_lgbm_oof_v2(cfg, n_features=50, cached_data=None):
         colsample_bytree=0.8,
         verbose=-1,
         objective='multiclass',
-        class_weight=weights_dict
+        class_weight=dynamic_weights
     )
     final_model.fit(X_res_all, yres_all_enc)
     

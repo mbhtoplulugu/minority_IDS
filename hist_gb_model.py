@@ -79,11 +79,13 @@ def run_hist_gb_oof(cfg, n_features=50, n_splits=5):
         X_fold_tr, y_fold_tr = Xt_tr[trn_idx], ytr_enc[trn_idx]
         X_fold_val, y_fold_val = Xt_tr[val_idx], ytr_enc[val_idx]
         
-        # HistGB Parameters specified by the Research Agent for 16GB
+        # HistGB Parameters - Optimized for Generalization (prevents memorization of 3-5 samples)
         clf = HistGradientBoostingClassifier(
-            max_iter=200,             
-            max_leaf_nodes=31,        
-            max_bins=63,              # CRITICAL: Memory saver
+            max_iter=120,             # Reduced from 200 to prevent overfitting
+            max_leaf_nodes=47,        # Balanced nodes
+            max_bins=63,              
+            l2_regularization=2.0,    # Stronger regularization
+            min_samples_leaf=25,      # Prevent tiny leaves
             class_weight='balanced',  
             early_stopping=True,
             validation_fraction=0.1,

@@ -67,36 +67,60 @@ def create_attack_specific_features(X, original_feature_names):
     attack_features = []
     feature_names = []
     
-    # 1. WORMS-SPECIFIC FEATURES (Updated with Fan-Out Ratio)
+    # =====================================================================
+    # ⚠️ BEST PRACTICE UYARISI: 'srcip', 'dstip' gibi kolonlar modelde 
+    # Data Leakage (Veri Sizintisi) yapar. Bu yuzden bu ozellikler 
+    # yorum satirina alinarak pasiflestirildi. Eger UNSW-NB15 basarisi 
+    # %64'un altina duserse ve overfitting pahasina da olsa eski skora 
+    # donmek istenirse buradaki yorum satirlari acilabilir.
+    # Ancak CICIDS17 veya gercek dunya verilerinde bu kod patlar/calismaz!
+    # =====================================================================
+    
+    # --- ESKI WORMS & ANALYSIS (IP TABANLI) KODLARI BURADA (KAPALI) ---
+    """
     if 'srcip' in df.columns and 'dstip' in df.columns:
-        # IP diversity (basitletirilmi entropy) - map ile tm satrlara yay
         ip_diversity_map = df.groupby('srcip')['dstip'].nunique() / df.groupby('srcip').size()
         ip_diversity = df['srcip'].map(ip_diversity_map).fillna(0).values
         attack_features.append(ip_diversity)
         feature_names.append('ip_diversity_ratio')
         
-        # NEW: Fan-Out Ratio (Spreading behavior)
-        # Ratio of unique destinations to the total number of connections for that source
         fan_out = df.groupby('srcip')['dstip'].transform('nunique') / (df.groupby('srcip')['srcip'].transform('count') + 1e-10)
         attack_features.append(fan_out.values)
         feature_names.append('fan_out_ratio')
 
     if 'srcip' in df.columns and 'dsport' in df.columns:
-        # Port diversity - map ile tm satrlara yay
         port_diversity_map = df.groupby('srcip')['dsport'].nunique() / df.groupby('srcip').size()
         port_diversity = df['srcip'].map(port_diversity_map).fillna(0).values
         attack_features.append(port_diversity)
         feature_names.append('port_diversity_ratio')
 
-    # 2. ANALYSIS-SPECIFIC FEATURES  
     if 'srcip' in df.columns and 'proto' in df.columns:
-        # Protocol concentration - map ile tm satrlara yay
         proto_concentration_map = df.groupby('srcip')['proto'].apply(
             lambda x: x.value_counts().max() / len(x)
         )
         proto_concentration = df['srcip'].map(proto_concentration_map).fillna(0).values
         attack_features.append(proto_concentration)
         feature_names.append('protocol_concentration')
+    """
+
+    # =====================================================================
+    # YENI ROBUST & DATASET-AGNOSTIC OZELLIKLER (HER VERI SETINDE CALISIR)
+    # =====================================================================
+    
+    # 1. NEW WORMS/BOTNET-SPECIFIC: Iletisim Verimliligi (Communication Efficiency)
+    # C2 (Command & Control) trafigi genelde sabittir, normal trafik degisken.
+    if 'sbytes' in df.columns and 'dbytes' in df.columns and 'spkts' in df.columns and 'dpkts' in df.columns:
+        comm_efficiency = (df['sbytes'] + df['dbytes']) / (df['spkts'] + df['dpkts'] + 1e-10)
+        attack_features.append(comm_efficiency.values)
+        feature_names.append('communication_efficiency')
+
+    # 2. NEW ANALYSIS/RECON-SPECIFIC: Toplam Akis Yogunlugu (Activity Intensity)
+    # Port taramalari saniyede inanilmaz sayida paket gonderir ama karsilik almaz.
+    if 'spkts' in df.columns and 'dpkts' in df.columns and 'dur' in df.columns:
+        activity_intensity = (df['spkts'] + df['dpkts']) / (df['dur'] + 1e-10)
+        attack_features.append(activity_intensity.values)
+        feature_names.append('activity_intensity')
+
 
     # 3. BACKDOOR-SPECIFIC FEATURES
     if 'dur' in df.columns:
@@ -270,38 +294,43 @@ def check_cache_consistency(cache_dir):
         return False
     return True
 
-def run_feature_engineering_pipeline(cfg, n_features=30, method='enhanced'):
-    """Optimized feature engineering pipeline - TM SINIFLAR N"""
+def run_feature_engineering_pipeline(cfg, n_features=75, method='enhanced'):
+    """
+    Optimized feature engineering pipeline for IDS datasets.
+    Dataset-agnostic: relies on pre-normalized column names from data_preprocessing.py.
+    """
     cache_dir = Path(cfg.cache_dir)
     
     if not check_cache_consistency(cache_dir):
         raise RuntimeError("Cache files missing. Run preprocessing first.")
     
-    # Veri ykle
+    # 1. Smart Caching: Return if already exists
+    target_files = [
+        cache_dir / f"Xt_tr_enhanced{n_features}.joblib",
+        cache_dir / f"Xt_v_enhanced{n_features}.joblib",
+        cache_dir / f"Xt_te_enhanced{n_features}.joblib"
+    ]
+    if all(f.exists() for f in target_files):
+        print(f"Enhanced features for n={n_features} already exist in {cache_dir}. Skipping.")
+        return n_features
+
+    # 2. Load Base Data
+    print(f"Generating Enhanced Features in {cache_dir} (Target: {n_features})")
     Xt_tr = joblib.load(cache_dir / "Xt_tr.joblib")
     Xt_v = joblib.load(cache_dir / "Xt_v.joblib") 
     Xt_te = joblib.load(cache_dir / "Xt_te.joblib")
     y_tr = joblib.load(cache_dir / "y_tr.joblib")
     
-    print(f"Original shape: {Xt_tr.shape}")
+    # Original feature names from preprocess meta
+    try:
+        meta = joblib.load(cache_dir / "preprocess_meta.joblib")
+        original_names = meta["num_cols"] + meta["cat_cols"]
+    except:
+        original_names = [f"feature_{i}" for i in range(Xt_tr.shape[1])]
     
-    if method == 'simple':
-        # Simple method - sadece PCA
-        Xt_tr_final = create_smaller_input_features(Xt_tr, 'pca', n_features, cache_dir)
-        Xt_v_final = apply_feature_reduction(Xt_v, 'pca', n_features, cache_dir)
-        Xt_te_final = apply_feature_reduction(Xt_te, 'pca', n_features, cache_dir)
-        
-    elif method == 'enhanced':
-        print("Creating OPTIMIZED enhanced features...")
-        
-        # Original feature names from preprocess meta
-        try:
-            meta = joblib.load(cache_dir / "preprocess_meta.joblib")
-            original_names = meta["num_cols"] + meta["cat_cols"]
-        except:
-            original_names = [f"feature_{i}" for i in range(Xt_tr.shape[1])]
-        
-        # Z-score outlier detection
+    if method == 'enhanced':
+        # 3. Feature Augmentation
+        # A. Statistical Outlier Indicators
         zscore_count_tr = count_features_with_zscore_above_3(Xt_tr)
         zscore_count_v = count_features_with_zscore_above_3(Xt_v)
         zscore_count_te = count_features_with_zscore_above_3(Xt_te)
@@ -310,90 +339,67 @@ def run_feature_engineering_pipeline(cfg, n_features=30, method='enhanced'):
         extreme_v = mark_values_in_top_bottom_1_percent(Xt_v).sum(axis=1)
         extreme_te = mark_values_in_top_bottom_1_percent(Xt_te).sum(axis=1)
         
-        # Core statistical moments
+        # B. Moments (Skew/Kurtosis)
         stat_tr = create_core_statistical_features(Xt_tr)
         stat_v = create_core_statistical_features(Xt_v)
         stat_te = create_core_statistical_features(Xt_te)
         
-        # Anomaly scores
+        # C. Anomaly Discovery (Isolation Forest)
         iso_forest = IsolationForest(random_state=42, n_jobs=-1, contamination=0.1)
         iso_scores_tr = iso_forest.fit(Xt_tr).decision_function(Xt_tr)
         iso_scores_v = iso_forest.decision_function(Xt_v)
         iso_scores_te = iso_forest.decision_function(Xt_te)
         
-        # Attack-specific features
-        attack_tr, attack_names = create_attack_specific_features(Xt_tr, original_names)
+        # D. Domain Knowledge Features (DoS, Recon, etc.)
+        attack_tr, _ = create_attack_specific_features(Xt_tr, original_names)
         attack_v, _ = create_attack_specific_features(Xt_v, original_names)
         attack_te, _ = create_attack_specific_features(Xt_te, original_names)
         
-        # Sadece base features iin SelectKBest (custom features korunur)
-        Xt_tr_base = np.column_stack([
-            Xt_tr, zscore_count_tr, extreme_tr, stat_tr,
-            iso_scores_tr
-        ])
-        Xt_v_base = np.column_stack([
-            Xt_v, zscore_count_v, extreme_v, stat_v,
-            iso_scores_v
-        ])
-        Xt_te_base = np.column_stack([
-            Xt_te, zscore_count_te, extreme_te, stat_te,
-            iso_scores_te
-        ])
+        # Combine everything
+        Xt_tr_aug = np.column_stack([Xt_tr, zscore_count_tr, extreme_tr, stat_tr, iso_scores_tr, attack_tr])
+        Xt_v_aug  = np.column_stack([Xt_v, zscore_count_v, extreme_v, stat_v, iso_scores_v, attack_v])
+        Xt_te_aug = np.column_stack([Xt_te, zscore_count_te, extreme_te, stat_te, iso_scores_te, attack_te])
         
-        num_attack_features = attack_tr.shape[1] if attack_tr.shape[1] > 0 else 0
-        features_to_select = max(1, n_features - num_attack_features)
+        # 4. Dimensionality Management (SelectKBest)
+        actual_pool = Xt_tr_aug.shape[1]
+        print(f"Feature pool: {actual_pool} -> Selecting best {n_features}")
         
-        current_base_features = Xt_tr_base.shape[1]
+        from sklearn.preprocessing import LabelEncoder
+        le_temp = LabelEncoder()
+        y_tr_enc = le_temp.fit_transform(y_tr)
         
-        if current_base_features > features_to_select:
-            # Sadece base zellikler zerinde seim yap
-            Xt_tr_selected_base, selector = select_best_features_with_y(Xt_tr_base, y_tr, k=features_to_select)
-            Xt_v_selected_base = selector.transform(Xt_v_base)
-            Xt_te_selected_base = selector.transform(Xt_te_base)
-            joblib.dump(selector, cache_dir / f'feature_selector_{features_to_select}.joblib')
-            print(f"SelectKBest (Base): {current_base_features} -> {features_to_select} features")
-        else:
-            Xt_tr_selected_base, Xt_v_selected_base, Xt_te_selected_base = Xt_tr_base, Xt_v_base, Xt_te_base
-            print(f"No base feature selection needed: {current_base_features} <= {features_to_select}")
+        selector = SelectKBest(f_classif, k=n_features)
+        Xt_tr_final = selector.fit_transform(Xt_tr_aug, y_tr_enc)
+        Xt_v_final  = selector.transform(Xt_v_aug)
+        Xt_te_final = selector.transform(Xt_te_aug)
         
-        # Seilmi zelliklerle korunan attack feature'lar birletir
-        if num_attack_features > 0:
-            Xt_tr_selected = np.column_stack([Xt_tr_selected_base, attack_tr])
-            Xt_v_selected = np.column_stack([Xt_v_selected_base, attack_v])
-            Xt_te_selected = np.column_stack([Xt_te_selected_base, attack_te])
-            print(f"Protected {num_attack_features} custom attack features. Total: {Xt_tr_selected.shape[1]}")
-        else:
-            Xt_tr_selected, Xt_v_selected, Xt_te_selected = Xt_tr_selected_base, Xt_v_selected_base, Xt_te_selected_base
-            print(f"No custom attack features generated. Total: {Xt_tr_selected.shape[1]}")
-        
-        # Final features (PCA sadece gerekirse)
-        if Xt_tr_selected.shape[1] > n_features:
-            Xt_tr_final = create_smaller_input_features(Xt_tr_selected, 'pca', n_features, cache_dir)
-            Xt_v_final = apply_feature_reduction(Xt_v_selected, 'pca', n_features, cache_dir)
-            Xt_te_final = apply_feature_reduction(Xt_te_selected, 'pca', n_features, cache_dir)
-        else:
-            # PCA'ya gerek yok, direkt kullan
-            Xt_tr_final, Xt_v_final, Xt_te_final = Xt_tr_selected, Xt_v_selected, Xt_te_selected
-            print(f"No PCA needed: {Xt_tr_selected.shape[1]} features")
-        
-        # === CRITICAL: Scale final features ===
-        # Baz engineered zellikler (rate gibi) ok byk olabilir ve MLP'yi bozabilir.
-        print("Scaling final engineered features...")
+        # 5. Global Scaling (Crucial for Neural Networks like TabNet/MLP)
         scaler = StandardScaler()
         Xt_tr_final = scaler.fit_transform(Xt_tr_final)
-        Xt_v_final = scaler.transform(Xt_v_final)
+        Xt_v_final  = scaler.transform(Xt_v_final)
         Xt_te_final = scaler.transform(Xt_te_final)
-        joblib.dump(scaler, cache_dir / f"scaler_enhanced{Xt_tr_final.shape[1]}.joblib")
+        
+        # 6. Save and Return
+        joblib.dump(Xt_tr_final, cache_dir / f"Xt_tr_enhanced{n_features}.joblib", compress=3)
+        joblib.dump(Xt_v_final,  cache_dir / f"Xt_v_enhanced{n_features}.joblib",  compress=3)
+        joblib.dump(Xt_te_final, cache_dir / f"Xt_te_enhanced{n_features}.joblib", compress=3)
+        print(f"Successfully saved {n_features} enhanced features to {cache_dir}")
+        return n_features
+    else:
+        # Fallback to PCA or original
+        Xt_tr_final = create_smaller_input_features(Xt_tr, 'pca', n_features, cache_dir)
+        Xt_v_final = apply_feature_reduction(Xt_v, 'pca', n_features, cache_dir)
+        Xt_te_final = apply_feature_reduction(Xt_te, 'pca', n_features, cache_dir)
+        return Xt_tr_final.shape[1]
+
+if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--cache-dir', type=str, required=True)
+    ap.add_argument('--n-features', type=int, default=75)
+    args = ap.parse_args()
     
-    print(f"Final shape: {Xt_tr_final.shape}")
+    class FakeCfg:
+        def __init__(self, cdir): self.cache_dir = cdir
     
-    # Cache kaydet
-    actual_features = Xt_tr_final.shape[1]
-    suffix = f"_{method}{actual_features}"
-    joblib.dump(Xt_tr_final, cache_dir / f"Xt_tr{suffix}.joblib")
-    joblib.dump(Xt_v_final, cache_dir / f"Xt_v{suffix}.joblib")
-    joblib.dump(Xt_te_final, cache_dir / f"Xt_te{suffix}.joblib")
-    
-    print(f"Enhanced features saved with suffix: {suffix} (actual features: {actual_features})")
-    
-    return Xt_tr_final, Xt_v_final, Xt_te_final
+    run_feature_engineering_pipeline(FakeCfg(args.cache_dir), n_features=args.n_features)

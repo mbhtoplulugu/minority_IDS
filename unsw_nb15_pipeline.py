@@ -24,10 +24,14 @@ from smote_enn import Config as PipelineConfig
 try:
     from experts import train_experts_ovr, ExpCfg as ExpertsCfg
     from stack_experts import stack_with_experts
+    from feature_engineering_fixed import run_feature_engineering_pipeline
+    from tabnet_model import run_tabnet_oof
 except Exception:
     train_experts_ovr = None
     ExpertsCfg = None
     stack_with_experts = None
+    run_feature_engineering_pipeline = None
+    run_tabnet_oof = None
 
 warnings.filterwarnings("ignore")
 
@@ -55,6 +59,11 @@ class Config:
     batch_size:int=1024
     lr:float=1e-3
     epochs:int=10
+    # ===== DUAL-MODE =====
+    dataset_mode:str='unsw'      # 'unsw' veya 'cicids'
+    train_csv:str|None=None      # CICIDS modu icin
+    test_csv:str|None=None       # CICIDS modu icin
+    exclude_weak:bool=False      # Zayif siniflari verisetinden at
 
 # ================= IO + Preprocess =================
 def detect_gpu_tree_method(prefer_gpu: bool = True) -> str:
@@ -124,6 +133,7 @@ def preprocess_and_cache(cfg: Config):
     """
     DPConfig ile cache'i garanti eder, Xt_* ve y_*'yi dndrr.
     Downstream uyumu iin X: np.ndarray (float32, C-contig), y: pd.Series.
+    Dual-mode: cfg.dataset_mode'a gore UNSW veya CICIDS verisini yukler.
     """
     from data_preprocessing import DPConfig, ensure_preprocessed
 
@@ -138,7 +148,12 @@ def preprocess_and_cache(cfg: Config):
         use_minmax_for_cat=True,
         scale_numeric=True,
         strict_feature_list=False,
+        dataset_mode=getattr(cfg, 'dataset_mode', 'unsw'),
+        train_csv=getattr(cfg, 'train_csv', None),
+        test_csv=getattr(cfg, 'test_csv', None),
+        exclude_weak=getattr(cfg, 'exclude_weak', False),
     )
+    _info(f"Dataset mode: {dp.dataset_mode}")
     Xt_tr, y_tr, Xt_v, y_v, Xt_te, y_te, _ = ensure_preprocessed(dp)
 
     # ---> Tipleri normalize et (downstreamde srtnmeyi azaltr)
@@ -222,15 +237,40 @@ def apply_smart_resampling(X: np.ndarray, y, cfg: Config):
 
 # ================= MODELS =================
 def focal_loss_multiclass_xgb(y_true, y_pred):
-    """Custom Multiclass Focal Loss for XGBoost"""
+    """Custom Multiclass Focal Loss for XGBoost - DYNAMIC SCALE"""
     gamma = 2.0
-    alpha = np.array([5.0, 6.0, 1.5, 1.1, 1.8, 0.8, 0.7, 1.1, 1.5, 15.0])
     
     y = y_true if not hasattr(y_true, 'get_label') else y_true.get_label()
     y = y.astype(int)
-    n_classes = 10
     
+    # Kacinci sinif oldugunu otomatik tespit et
     is_1d = (y_pred.ndim == 1)
+    if is_1d:
+        # XGBoost flattened output verirse
+        # (n_samples * n_classes) boyutundadir. 
+        # n_classes'i y'nin max degerinden bulmaya calisalim (en garantisi static n_classes gecirmektir ama XGB buna izin vermez kolayca)
+        # O yuzden global veya class_count uzerinden gitmeliyiz.
+        pass
+
+    # Not: Bu fonksiyonun icinde LabelEncoder'a erismek icin global kullanmali veya 
+    # predict_proba'dan sonra cagirmaliyiz. Ancak XGB training sirasinda cagirdigi icin:
+    # Simdilik varsayilan 10, eger y_pred seklinden anlasiliyorsa onu kullan:
+    n_classes = 10 
+    if not is_1d:
+        n_classes = y_pred.shape[1]
+    else:
+        # XGB flatten yapinca n_samples * n_classes olur. 
+        # y.shape[0] * n_classes = y_pred.shape[0]
+        n_classes = len(y_pred) // len(y)
+
+    # Dinamik alpha (azinlik siniflara daha fazla agirlik)
+    # Varsayilan olarak 1.0, ama bazi siniflar icin manuel yukseltilebilir
+    alpha = np.ones(n_classes, dtype=np.float32)
+    # Azinlik siniflar (UNSW-NB15 icin 0-9 arasi bazi indeksler)
+    # Gercek IDS'lerde genellikle ilk veya son sinif normaldir, digerleri saldiridir.
+    for i in range(n_classes):
+        alpha[i] = 2.0 # Genel saldiri agirligi
+    
     if is_1d:
         preds = y_pred.reshape(-1, n_classes)
     else:
@@ -243,8 +283,7 @@ def focal_loss_multiclass_xgb(y_true, y_pred):
     hess = p * (1.0 - p)
     
     for i in range(n_classes):
-        alpha_factor = alpha[i] if i < len(alpha) else 1.0
-        weight_factor = alpha_factor * np.power(1.0 - p[:, i], gamma)
+        weight_factor = alpha[i] * np.power(1.0 - p[:, i], gamma)
         grad[:, i] *= weight_factor
         hess[:, i] *= weight_factor
         
@@ -387,44 +426,73 @@ def run_autoencoder(cfg, n_features=50):
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="UNSW-NB15 unified pipeline (OOF Level-2 Stacking)")
+    ap = argparse.ArgumentParser(description="Dataset-Agnostic IDS Pipeline (OOF Level-2 Stacking)")
+    
+    # ===== DATASET MODE =====
+    mode_group = ap.add_mutually_exclusive_group()
+    mode_group.add_argument('--unsw', action='store_true', default=True, help='UNSW-NB15 modu (default)')
+    mode_group.add_argument('--cicids', action='store_true', help='CICIDS17 modu')
+    
     ap.add_argument('--files-glob', type=str, default=None)
     ap.add_argument('--features-csv', type=str, default=None)
     ap.add_argument('--cache-dir', type=str, default='.')
+    # CICIDS specific
+    ap.add_argument('--train-csv', type=str, default=None, help='CICIDS train CSV yolu')
+    ap.add_argument('--test-csv', type=str, default=None, help='CICIDS test CSV yolu')
 
     # Core Execution Flags
-    ap.add_argument('--prep-only',    action='store_true', help='Sadece preprocess + cache ret')
-    ap.add_argument('--run-xgb',      action='store_true', help='XGBoost OOF P_train ret')
-    ap.add_argument('--run-lgbm',     action='store_true', help='LightGBM OOF P_train ret')
-    ap.add_argument('--run-lgbm-v2',  action='store_true', help='LightGBM V2 OOF P_train ret')
-    ap.add_argument('--run-histgb',   action='store_true', help='HistGradientBoosting (Low RAM CPU) OOF P_train ret')
-    ap.add_argument('--run-mlp',      action='store_true', help='MLP OOF P_train ret')
-    ap.add_argument('--run-autoencoder', action='store_true', help='Autoencoder modelini eit')
-    ap.add_argument('--train-experts', action='store_true', help='(DEPRECATED) Eski OVR Uzmanlarn eit')
-    ap.add_argument('--run-fast-experts', action='store_true', help='<0.80 F1 olan snflar iin Hzl Binary Uzmanlarn eit')
-    ap.add_argument('--run-stack-experts', action='store_true', help='Level-2 Meta-Model eit ve deerlendir')
-    ap.add_argument('--run-heuristic-ensemble', action='store_true', help='Kural Tabanl (Heuristic) Akll Melezleme Yap')
-    ap.add_argument('--run-all',      action='store_true', help='Tm boru hattn srayla altr')
+    ap.add_argument('--prep-only',    action='store_true', help='Sadece preprocess + cache uret')
+    ap.add_argument('--run-xgb',      action='store_true', help='XGBoost OOF P_train uret')
+    ap.add_argument('--run-lgbm',     action='store_true', help='LightGBM OOF P_train uret')
+    ap.add_argument('--run-lgbm-v2',  action='store_true', help='LightGBM V2 OOF P_train uret')
+    ap.add_argument('--run-histgb',   action='store_true', help='HistGradientBoosting (Low RAM CPU) OOF P_train uret')
+    ap.add_argument('--run-mlp',      action='store_true', help='MLP OOF P_train uret')
+    ap.add_argument('--run-tabnet',   action='store_true', help='TabNet Multi-class OOF P_train uret')
+    ap.add_argument('--run-autoencoder', action='store_true', help='Autoencoder modelini egit')
+    ap.add_argument('--train-experts', action='store_true', help='(DEPRECATED) Eski OVR Uzmanlari egit')
+    ap.add_argument('--run-fast-experts', action='store_true', help='<0.85 F1 olan siniflar icin Hizli Binary Uzmanlari egit')
+    ap.add_argument('--run-stack-experts', action='store_true', help='Level-2 Meta-Model egit ve degerlendir')
+    ap.add_argument('--run-heuristic-ensemble', action='store_true', help='Kural Tabanli (Heuristic) Akilli Melezleme Yap')
+    ap.add_argument('--run-all',      action='store_true', help='Tum boru hattini sirayla calistir')
+    ap.add_argument('--exclude-weak-classes', action='store_true', help='Ensemble basarisini hesaplarken en dusuk performansli siniflari(unsw: analysis,backdoor / cicids: xss,infiltration) hesaplamadan cikar')
     
     # Options
-    ap.add_argument('--no-gpu',       action='store_true', help='GPU kullanmn devre d brak')
-    ap.add_argument('--focus', nargs='*', default=None, help='Uzmanlar iin odak snflar (rn: analysis backdoor)')
-    ap.add_argument('--n-features', type=int, default=65, help='Tm modeller iin temel feature says (Phase 3 iin 65)')
+    ap.add_argument('--no-gpu',       action='store_true', help='GPU kullanimini devre disi birak')
+    ap.add_argument('--focus', nargs='*', default=None, help='Uzmanlar icin odak siniflar (orn: analysis backdoor)')
+    ap.add_argument('--n-features', type=int, default=75, help='Tum modeller icin temel feature sayisi')
 
     args = ap.parse_args()
     
-    FILES_GLOB = r"C:/Users/mbhto/source/repos/UNSW-NB15/UNSWNB15_[0-5].csv" if args.files_glob is None else args.files_glob
-    FEATURES_CSV = r"C:/Users/mbhto/source/repos/UNSW-NB15/NUSW-NB15_features.csv" if args.features_csv is None else args.features_csv
-    CACHEDIR = Path(args.cache_dir)
+    # ===== DATASET MODE RESOLVE =====
+    dataset_mode = 'cicids' if args.cicids else 'unsw'
+    
+    if dataset_mode == 'cicids':
+        FILES_GLOB = ''  # CICIDS modunda kullanilmaz
+        FEATURES_CSV = ''  # CICIDS modunda kullanilmaz
+        _stage("=== CICIDS17 MODU ===")
+    else:
+        FILES_GLOB = r"C:/Users/mbhto/source/repos/UNSW-NB15/UNSWNB15_[0-5].csv" if args.files_glob is None else args.files_glob
+        FEATURES_CSV = r"C:/Users/mbhto/source/repos/UNSW-NB15/NUSW-NB15_features.csv" if args.features_csv is None else args.features_csv
+        _stage("=== UNSW-NB15 MODU ===")
+    
+    cache_mode_name = dataset_mode + "_excluded" if args.exclude_weak_classes else dataset_mode
+    CACHEDIR = Path(args.cache_dir) / cache_mode_name
     CACHEDIR.mkdir(parents=True, exist_ok=True)
     
-    cfg = Config(files_glob=FILES_GLOB, features_csv=FEATURES_CSV, use_gpu=(not getattr(args,'no_gpu',False)))
+    cfg = Config(
+        files_glob=FILES_GLOB, features_csv=FEATURES_CSV,
+        use_gpu=(not getattr(args,'no_gpu',False)),
+        dataset_mode=dataset_mode,
+        train_csv=args.train_csv,
+        test_csv=args.test_csv,
+        exclude_weak=args.exclude_weak_classes,
+    )
     cfg.cache_dir = str(CACHEDIR)
 
     # Hi bayrak gelmezse veya run-all gelirse
     run_all = args.run_all or not any([
         args.prep_only, args.run_xgb, args.run_lgbm, args.run_lgbm_v2,
-        args.run_histgb, args.run_mlp, args.run_autoencoder, 
+        args.run_histgb, args.run_mlp, args.run_tabnet, args.run_autoencoder, 
         args.train_experts, args.run_fast_experts, 
         args.run_stack_experts, args.run_heuristic_ensemble
     ])
@@ -440,8 +508,14 @@ def main():
         _stage("Running preprocessing (once for all models)")
         _cached_data = preprocess_and_cache(cfg)
 
-        # We are sticking to the original 36 features to prevent bloat and save RAM.
-        _cached_data_orig = _cached_data  # Orijinal veri (36)
+        # Dataset-Agnostic Feature Engine (Dinamik Ozellik Sentezi)
+        if run_feature_engineering_pipeline:
+            actual_n = run_feature_engineering_pipeline(cfg, n_features=args.n_features, method='enhanced')
+            if actual_n:
+                args.n_features = actual_n
+
+        # Use the original features from the preprocessed data.
+        _cached_data_orig = _cached_data
 
     # === MODELLER ICIN FARKLI VERI KELERI HAZIRLA ===
     # Bu blok her zaman alr: model admlar iin orig/enh verisi gerekiyor.
@@ -452,14 +526,11 @@ def main():
             _stage("Lazily loading original preprocessed data for model steps")
             _cached_data_orig = preprocess_and_cache(cfg)
         if _cached_data_enh is None:
-            enhanced_pattern = str(CACHEDIR / "Xt_tr_enhanced*.joblib")
-            enhanced_files_found = glob.glob(enhanced_pattern)
-            if enhanced_files_found:
-                import re as _re
-                latest = sorted(enhanced_files_found)[-1]
-                match = _re.search(r'enhanced(\d+)', latest)
-                actual_n_feat = int(match.group(1)) if match else args.n_features
-                _stage(f"Loading enhanced features (n={actual_n_feat}) for LGBM/MLP/Experts")
+            import re as _re
+            target_enh = CACHEDIR / f'Xt_tr_enhanced{args.n_features}.joblib'
+            if target_enh.exists():
+                actual_n_feat = args.n_features
+                _stage(f"Loading enhanced features (n={actual_n_feat}) from exact match.")
                 Xt_tr_enh = joblib.load(CACHEDIR / f'Xt_tr_enhanced{actual_n_feat}.joblib')
                 Xt_v_enh  = joblib.load(CACHEDIR / f'Xt_v_enhanced{actual_n_feat}.joblib')
                 Xt_te_enh = joblib.load(CACHEDIR / f'Xt_te_enhanced{actual_n_feat}.joblib')
@@ -467,14 +538,31 @@ def main():
                 _cached_data_enh = (Xt_tr_enh, y_tr, Xt_v_enh, y_v, Xt_te_enh, y_te)
                 _info(f"Enhanced data ready: {Xt_tr_enh.shape[1]} features.")
             else:
-                _info("Enhanced features not found! Falling back to original for all models.")
-                _cached_data_enh = _cached_data_orig
+                enhanced_pattern = str(CACHEDIR / "Xt_tr_enhanced*.joblib")
+                enhanced_files_found = glob.glob(enhanced_pattern)
+                if enhanced_files_found:
+                    def _get_n(file_path):
+                        m = _re.search(r'enhanced(\d+)', file_path)
+                        return int(m.group(1)) if m else 0
+                    latest = sorted(enhanced_files_found, key=_get_n)[-1]
+                    actual_n_feat = _get_n(latest) or args.n_features
+                    _stage(f"Loading enhanced features (n={actual_n_feat}) for LGBM/MLP/Experts")
+                    Xt_tr_enh = joblib.load(CACHEDIR / f'Xt_tr_enhanced{actual_n_feat}.joblib')
+                    Xt_v_enh  = joblib.load(CACHEDIR / f'Xt_v_enhanced{actual_n_feat}.joblib')
+                    Xt_te_enh = joblib.load(CACHEDIR / f'Xt_te_enhanced{actual_n_feat}.joblib')
+                    _, y_tr, _, y_v, _, y_te = _cached_data_orig
+                    _cached_data_enh = (Xt_tr_enh, y_tr, Xt_v_enh, y_v, Xt_te_enh, y_te)
+                    _info(f"Enhanced data ready: {Xt_tr_enh.shape[1]} features.")
+                else:
+                    _info("Enhanced features not found! Falling back to original for all models.")
+                    _cached_data_enh = _cached_data_orig
 
-    # 2. Level-1 / XGBoost (OOF) - ORIGINAL (36) FEATURES
+    # 2. Level-1 / XGBoost (OOF) - ENHANCED FEATURES
     if run_all or args.run_xgb:
         _ensure_data_loaded()
-        _info("Running XGBoost on ORIGINAL (36) features...")
-        run_xgb_oof(cfg, cached_data=_cached_data_orig) # Her zaman orijinali kullan
+        _data_to_use = _cached_data_enh if _cached_data_enh is not None else _cached_data_orig
+        _info(f"Running XGBoost on ({_data_to_use[0].shape[1]}) features...")
+        run_xgb_oof(cfg, cached_data=_data_to_use)
 
     # 2.5 Level-1 / LightGBM (OOF) - ENHANCED (58) FEATURES
     if run_all or args.run_lgbm:
@@ -486,13 +574,14 @@ def main():
         except Exception as e:
             _info(f"LGBM model run failed: {e}")
 
-    # 2.6 Level-1 / LightGBM V2 (OOF) - ORIGINAL (36) FEATURES
+    # 2.6 Level-1 / LightGBM V2 (OOF) - ENHANCED FEATURES
     if run_all or args.run_lgbm_v2:
         _ensure_data_loaded()
         try:
             from lightgbm_model_v2 import run_lgbm_oof_v2
-            _info("Running LightGBM V2 on ORIGINAL (36) features...")
-            run_lgbm_oof_v2(cfg, n_features=args.n_features, cached_data=_cached_data_orig) # Her zaman orijinali kullan
+            _data_to_use = _cached_data_enh if _cached_data_enh is not None else _cached_data_orig
+            _info(f"Running LightGBM V2 on ({_data_to_use[0].shape[1]}) features...")
+            run_lgbm_oof_v2(cfg, n_features=args.n_features, cached_data=_data_to_use)
         except Exception as e:
             _info(f"LGBM V2 model run failed: {e}")
 
@@ -519,6 +608,18 @@ def main():
         except Exception as e:
             _info(f"MLP model run failed: {e}")
 
+    # 3.5 Level-1 / TabNet (Sequential Attention Multi-class)
+    if run_all or args.run_tabnet:
+        try:
+            if run_tabnet_oof:
+                _info("Running TabNet Multi-class on ENHANCED features...")
+                run_tabnet_oof(cfg, n_features=args.n_features, cached_data=_cached_data_enh)
+            else:
+                _info("run_tabnet_oof not imported!")
+        except Exception as e:
+            _info(f"TabNet model run failed: {e}")
+            import traceback; traceback.print_exc()
+
     # 4. Level-1 / Autoencoder
     if run_all or args.run_autoencoder:
         run_autoencoder(cfg, n_features=args.n_features)
@@ -528,23 +629,60 @@ def main():
         _info("Skipping old legacy experts. Handled by Fast Binary Experts.")
         pass
 
-    # 5.1 Level-1 / Fast Binary Experts (<80% F1 Otomatik Seim)
+    # 5.1 Level-1 / Fast Binary Experts (Dinamik F1 Tabanli Otomatik Secim)
     if run_all or args.run_fast_experts:
         from fast_binary_expert import fast_binary_experts
         from threshold_optimization import optimize_thresholds_fast
         import traceback
-        from sklearn.metrics import f1_score
+        from sklearn.metrics import f1_score, precision_recall_fscore_support
         
         try:
-            # We explicitly want to attack DoS, Backdoor, and Analysis
-            focus_classes = args.focus or ['dos', 'backdoor', 'analysis']
-            _info(f"Running Fast Binary LightGBM Experts for: {focus_classes}")
+            if args.focus:
+                # Kullanici manuel olarak sinif belirttiyse onu kullan
+                focus_classes = args.focus
+                _info(f"Manual focus classes: {focus_classes}")
+            else:
+                # OTONOM: Base Model (XGBoost) OOF Validation F1 < 0.85 olan siniflari bul
+                _info("Auto-detecting weak classes from Base Model validation performance...")
+                le_auto = joblib.load(CACHEDIR / 'label_encoder.joblib')
+                cls_names = le_auto.classes_.astype(str)
+                
+                # Validation proba dosyasini yukle
+                xgb_val_path = CACHEDIR / 'proba_xgb_oof_valid.npz'
+                if xgb_val_path.exists():
+                    y_v_auto = joblib.load(CACHEDIR / 'y_v.joblib')
+                    yv_enc = le_auto.transform(np.asarray(y_v_auto))
+                    data_val = np.load(xgb_val_path, allow_pickle=True)
+                    P_val = data_val['proba']
+                    yhat_val = P_val.argmax(axis=1)
+                    _, _, f1_per_class, _ = precision_recall_fscore_support(
+                        yv_enc, yhat_val, labels=range(len(cls_names)), zero_division=0)
+                    
+                    F1_THRESHOLD = 0.85
+                    focus_classes = []
+                    for i, c in enumerate(cls_names):
+                        if c == 'normal' or c == 'generic':  # Majority siniflar uzman gerektirmez
+                            continue
+                        if f1_per_class[i] < F1_THRESHOLD:
+                            # Yeterli ornege sahip mi kontrol et (en az 10 ornek)
+                            if np.sum(yv_enc == i) >= 10:
+                                focus_classes.append(c)
+                                _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} < {F1_THRESHOLD} => EXPERT ATANACAK")
+                            else:
+                                _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} < {F1_THRESHOLD} ama ornek < 10, ATLANDI")
+                        else:
+                            _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} >= {F1_THRESHOLD} => OK, uzman gerekmiyor")
+                else:
+                    _info("XGBoost OOF valid proba bulunamadi, fallback: tum azinlik siniflar.")
+                    focus_classes = [c for c in cls_names if c not in ('normal', 'generic')]
+            
+            _info(f"Final focus_classes (dynamic): {focus_classes}")
             
             if len(focus_classes) > 0:
                 fast_binary_experts(cache_dir=cfg.cache_dir, minority_classes=focus_classes, n_features=args.n_features)
                 optimize_thresholds_fast(cache_dir=cfg.cache_dir, minority_classes=focus_classes, n_features=args.n_features)
             else:
-                _info("Tm saldr snflar %80 F1 Skorunun zerinde! Binary uzmanlara gerek kalmad.")
+                _info("Tum saldir siniflari F1 esigini geciyor! Binary uzmanlara gerek kalmadi.")
         except Exception as e:
             _info(f"Fast Binary Experts run failed: {e}")
             traceback.print_exc()
@@ -560,7 +698,7 @@ def main():
     if run_all or args.run_heuristic_ensemble:
         try:
             from heuristic_ensemble import heuristic_ensemble
-            heuristic_ensemble(cache_dir=cfg.cache_dir)
+            heuristic_ensemble(cache_dir=cfg.cache_dir, exclude_weak=args.exclude_weak_classes)
         except Exception as e:
             _info(f"Heuristic Ensemble run failed: {e}")
             

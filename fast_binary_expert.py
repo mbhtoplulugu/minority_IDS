@@ -114,15 +114,19 @@ def fast_binary_experts(cache_dir, minority_classes, n_features=50):
         n_neg_orig = original_ratio[0]
         print(f"  Original ratio: 1:{n_neg_orig/max(n_pos_orig, 1):.1f} (pos={n_pos_orig}, neg={n_neg_orig})")
         
-        # Snfa gre adaptif rnekleme stratejisi
-        # Backdoor ve Fuzzers iin daha fazla veri al
-        if minority_class in ['backdoor', 'fuzzers']:
-            max_samples = 150000  # Daha byk sample
-            max_imbalance = 8     # Daha dengeli
-        elif minority_class == 'worms':
+        # Dinamik adaptif ornekleme: sinif buyuklugune gore otomatik ayar
+        # (Artik belirli sinif isimlerine bagli degil - dataset-agnostic)
+        minority_count_raw = int(np.sum(y_binary_train == 1))
+        majority_count_raw = int(np.sum(y_binary_train == 0))
+        raw_ratio = majority_count_raw / max(minority_count_raw, 1)
+        
+        if raw_ratio > 500:  # Cok nadir sinif (orn: worms, infiltration)
             max_samples = 100000
             max_imbalance = 5
-        else:
+        elif raw_ratio > 100:  # Nadir sinif (orn: backdoor, bot)
+            max_samples = 150000
+            max_imbalance = 8
+        else:  # Orta dengesizlik (orn: dos, portscan)
             max_samples = 80000
             max_imbalance = 10
         
@@ -145,9 +149,14 @@ def fast_binary_experts(cache_dir, minority_classes, n_features=50):
         # SMOTE ile minority snf oalt (zellikle backdoor iin kritik)
         if HAS_SMOTE and n_minority >= 6:  # SMOTE en az k_neighbors+1 sample ister
             try:
-                smote_ratio = min(0.3, n_minority / n_majority_target * 3)  # 3x oalt ama max %30'a
-                if minority_class in ['backdoor', 'worms']:
-                    smote_ratio = min(0.5, n_minority / n_majority_target * 5)  # Daha agresif
+                current_ratio = n_minority / max(n_majority_target, 1)
+                # Dinamik SMOTE orani: cok nadir siniflar icin agresif, orta icin olculu
+                if raw_ratio > 500:
+                    smote_ratio = min(0.5, current_ratio * 5)  # Agresif (cok nadir)
+                elif raw_ratio > 100:
+                    smote_ratio = min(0.4, current_ratio * 4)  # Orta agresif
+                else:
+                    smote_ratio = min(0.3, current_ratio * 3)  # Standart
                 
                 k_neighbors = min(5, n_minority - 1)
                 smote = SMOTE(sampling_strategy=smote_ratio, k_neighbors=k_neighbors, random_state=42)

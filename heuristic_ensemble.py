@@ -27,7 +27,7 @@ def get_f1_arr(y_true, y_pred_encoded, n_cls):
         y_true, y_pred_encoded, labels=range(n_cls), zero_division=0)
     return f1
 
-def heuristic_ensemble(cache_dir: str):
+def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     """
     Consolidated Comparative Analysis & Meta-Ensemble (Stacking)
     """
@@ -55,6 +55,7 @@ def heuristic_ensemble(cache_dir: str):
         'lgbmV2': 'LGBM_Ori',
         'histgb': 'HistGB',
         'mlp': 'MLP',
+        'tabnet': 'TabNet',
         'rf': 'RF'
     }
     
@@ -71,6 +72,8 @@ def heuristic_ensemble(cache_dir: str):
         name = p.stem.replace('proba_', '').replace('_oof_test', '')
         if name in main_models: continue
         
+        if 'aecnn' in name.lower() or 'ae_cnn' in name.lower(): continue
+        
         # Friendly names
         f_name = name.replace('fast_expert_', 'FE_').replace('expert_', 'E_').replace('bb_', 'BB_').replace('tabnet_', 'TN_').title()
         
@@ -79,12 +82,12 @@ def heuristic_ensemble(cache_dir: str):
         
         # Filter: Only add to table if it's "interesting" (e.g. good macro or very good at one class)
         # But for "all models comparative", let's at least show the ones that aren't zero.
-        if np.max(f1s) > 0.1: 
+        if np.max(f1s) > 0.01: 
              model_results[f_name] = f1s
 
     # --- 2. Print Comparative Table ---
     sorted_models = sorted(model_results.keys(), key=lambda x: np.mean(model_results[x]), reverse=True)
-    display_models = sorted_models[:8] # Keep 8 for neatness
+    display_models = sorted_models[:15] # Display up to 15 models to include experts
 
     print("\n" + "=" * 110)
     print(f"| {'DETAILED COMPARATIVE PERFORMANCE ANALYSIS (Test Set F1-Scores)':^106} |")
@@ -156,77 +159,199 @@ def heuristic_ensemble(cache_dir: str):
     
     # Load Base Test Predictions
     P_base_te = _load_aligned(cdir / f'proba_{base_model_key}_oof_test.npz', classes)
-    yhat_te = P_base_te.argmax(axis=1)
     
-    # Adim 2: Unified Surgical Override Pipeline
-    # Order is CRITICAL: Bd/An first (small, targeted), DoS next, then Shellcode, Worms LAST
-    # This order was empirically validated to maximize Macro F1 (0.6574)
+    is_cicids = 'bot' in classes
+
+    if is_cicids:
+        _info("CICIDS Dataset Detected! Applying Class-Wise Validation-Weighted Soft Voting...")
+        P_soft = np.zeros_like(P_base_te)
+        weight_sum = np.zeros(n_cls)
+        for m_key in main_models:
+            if m_key in val_model_results:
+                weight_arr = val_model_results[m_key]
+                p_path = cdir / f'proba_{m_key}_oof_test.npz'
+                if p_path.exists():
+                    P_m = _load_aligned(p_path, classes)
+                    P_soft += P_m * weight_arr
+                    weight_sum += weight_arr
+        weight_sum[weight_sum == 0] = 1e-9
+        P_soft /= weight_sum
+        yhat_te = P_soft.argmax(axis=1)
+        base_val_f1 = np.ones(n_cls) # mock to allow A and A.2 to run comparisons vs Soft Voting
+    else:
+        yhat_te = P_base_te.argmax(axis=1)
+        base_val_f1 = val_model_results.get(base_model_key, np.zeros(n_cls))
     
-    # --- 2a: Surgical Binary Experts (Backdoor, Analysis, DoS) ---
-    for surgical_cls in ['backdoor', 'analysis', 'dos']:
-        expert_path = cdir / f'surgical_{surgical_cls}_expert.pkl'
-        thresh_path = cdir / f'surgical_{surgical_cls}_threshold.pkl'
-        proba_path = cdir / f'proba_surgical_{surgical_cls}_oof_test.npz'
+    # ================================================================
+    # OTONOM OVERRIDE KEŞFI (Dataset-Agnostic)
+    # Hardcoded sinif isimleri YOK - tamamen performans bazli
+    # ================================================================
+    
+    # --- PHASE A: Surgical Binary Expert Override (Otonom Keşif) ---
+    _stage("Phase A: Auto-discovering Surgical Binary Expert Overrides (Validation-Based)")
+    
+    # Tum surgical expert dosyalarini tara
+    for expert_pkl in sorted(cdir.glob('surgical_*_expert.pkl')):
+        # Sinif adini dosya adindan cikar: surgical_dos_expert.pkl -> dos
+        cls_name = expert_pkl.stem.replace('surgical_', '').replace('_expert', '')
+        thresh_path = cdir / f'surgical_{cls_name}_threshold.pkl'
+        proba_path = cdir / f'proba_surgical_{cls_name}_oof_test.npz'
+        proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
         
-        if expert_path.exists() and thresh_path.exists() and proba_path.exists():
+        if not (thresh_path.exists() and proba_path.exists()):
+            continue
+        if cls_name not in classes:
+            continue
+            
+        c_idx = int(np.where(classes == cls_name)[0][0])
+        
+        # Validation uzerinde expert'in basarisini kontrol et
+        apply_override = True
+        if proba_val_path.exists():
+            P_surg_val = _load_aligned(proba_val_path, classes)
+            with open(thresh_path, 'rb') as f:
+                opt_thresh = pickle.load(f)
+            # Expert override uygulanmis tahmini olustur
+            temp_val = base_val_preds.copy()
+            surg_val_mask = P_surg_val[:, c_idx] >= opt_thresh
+            temp_val[surg_val_mask] = c_idx
+            mixed_f1 = get_f1_arr(yv_enc, temp_val, n_cls)
+            
+            # Expert, base model'den daha iyi mi?
+            if np.mean(mixed_f1) <= np.mean(base_val_f1):
+                _info(f"  -> {cls_name}: Surgical expert ATLANDI (Macro F1 iyilestirme yok)")
+                apply_override = False
+        
+        if apply_override:
             with open(thresh_path, 'rb') as f:
                 opt_thresh = pickle.load(f)
             P_surgical = _load_aligned(proba_path, classes)
-            c_idx = int(np.where(classes == surgical_cls)[0][0])
             surgical_mask = P_surgical[:, c_idx] >= opt_thresh
             count = int(np.sum(surgical_mask))
             yhat_te[surgical_mask] = c_idx
-            _info(f" -> SURGICAL: Overrode {count} predictions to '{surgical_cls}' (thresh >= {opt_thresh:.3f})")
+            _info(f"  -> SURGICAL: {cls_name} expert overrode {count} predictions (thresh >= {opt_thresh:.3f})")
 
-    # --- 2b: Shellcode Override (LGBM argmax - proven best for this class) ---
-    P_lgbm_te = _load_aligned(cdir / 'proba_lgbm_oof_test.npz', classes) if (cdir / 'proba_lgbm_oof_test.npz').exists() else None
-    P_lgbmV2_te = _load_aligned(cdir / 'proba_lgbmV2_oof_test.npz', classes) if (cdir / 'proba_lgbmV2_oof_test.npz').exists() else None
+    # --- PHASE A.2: Fast Binary Expert Override ---
+    _stage("Phase A.2: Auto-discovering Fast Binary Expert Overrides (Validation-Based)")
+    for expert_val_path in sorted(cdir.glob('proba_fast_expert_*_oof_valid.npz')):
+        m_key = expert_val_path.stem.replace('proba_', '').replace('_oof_valid', '')
+        cls_name = m_key.replace('fast_expert_', '')
+        if cls_name not in classes: continue
+        
+        expert_test_path = cdir / f'proba_{m_key}_oof_test.npz'
+        if not expert_test_path.exists(): continue
+        
+        c_idx = int(np.where(classes == cls_name)[0][0])
+        
+        P_fe_val = _load_aligned(expert_val_path, classes)
+        temp_val = base_val_preds.copy()
+        fe_val_mask = P_fe_val[:, c_idx] > 0.5
+        temp_val[fe_val_mask] = c_idx
+        mixed_f1 = get_f1_arr(yv_enc, temp_val, n_cls)
+        
+        if np.mean(mixed_f1) <= np.mean(base_val_f1):
+            _info(f"  -> {cls_name}: Fast expert ATLANDI (Macro F1 iyilestirme yok)")
+        else:
+            P_fe_te = _load_aligned(expert_test_path, classes)
+            fe_test_mask = P_fe_te[:, c_idx] > 0.5
+            count = int(np.sum(fe_test_mask))
+            yhat_te[fe_test_mask] = c_idx
+            _info(f"  -> FAST EXPERT: {cls_name} expert overrode {count} predictions (thresh > 0.5)")
     
-    shellcode_idx = int(np.where(classes == 'shellcode')[0][0])
-    if P_lgbm_te is not None:
-        sc_mask = P_lgbm_te.argmax(axis=1) == shellcode_idx
-        sc_count = int(np.sum(sc_mask))
-        yhat_te[sc_mask] = shellcode_idx
-        _info(f" -> SHELLCODE: Overrode {sc_count} predictions to 'shellcode' using LGBM argmax")
-
-    # --- 2c: Worms Boost (applied LAST - combined LGBM probas) ---
-    worms_idx = int(np.where(classes == 'worms')[0][0])
-    if P_lgbm_te is not None and P_lgbmV2_te is not None:
-        worms_combined = np.maximum(P_lgbm_te[:, worms_idx], P_lgbmV2_te[:, worms_idx])
-        worms_mask = worms_combined >= 0.70
-        worms_count = int(np.sum(worms_mask))
-        yhat_te[worms_mask] = worms_idx
-        _info(f" -> WORMS BOOST: Overrode {worms_count} predictions to 'worms' (combined lgbm+lgbmV2 >= 0.70)")
+    # --- PHASE B: Argmax Override (Ana Modeller Arası Otonom Karsilastirma) ---
+    if not is_cicids:
+        _stage("Phase B: Auto-discovering Argmax Overrides (Model vs Base per-class)")
+    
+        # Her ana model icin validation'da sinif bazli F1 karsilastir
+        for m_key in list(val_model_results.keys()):
+            if m_key == base_model_key or m_key not in main_models:
+                continue
+            
+            test_path = cdir / f'proba_{m_key}_oof_test.npz'
+            if not test_path.exists():
+                continue
+                
+            alt_f1 = val_model_results[m_key]
+            P_alt_te = _load_aligned(test_path, classes)
+            
+            for c_idx in range(n_cls):
+                cls_name = classes[c_idx]
+                if cls_name in ('normal', 'generic'):
+                    continue
+                
+                # Alternatif model bu sinifta base modelden anlamli olarak iyi mi?
+                improvement = alt_f1[c_idx] - base_val_f1[c_idx]
+                if improvement > 0.01:  # En az %1 iyilestirme
+                    # Override uygula: bu sinif icin alternatif modelin argmax tahminlerini kullan
+                    alt_mask = P_alt_te.argmax(axis=1) == c_idx
+                    override_count = int(np.sum(alt_mask))
+                    if override_count > 0:
+                        yhat_te[alt_mask] = c_idx
+                        _info(f"  -> ARGMAX: '{cls_name}' icin {override_count} tahmin "
+                              f"{main_models[m_key]} ile degistirildi "
+                              f"(Val F1: {alt_f1[c_idx]:.4f} vs Base {base_val_f1[c_idx]:.4f}, "
+                              f"+{improvement:.4f})")
+    
+    # --- PHASE C: Combined Probability Boost (Otonom) ---
+    if not is_cicids:
+        _stage("Phase C: Auto-discovering Combined Probability Boosts")
+    
+        # Her sinif icin: birden fazla modelin probability'lerini birlestirip threshold uygula
+        # Sadece base model'den cok zayif olan siniflar icin (F1 < 0.50)
+        for c_idx in range(n_cls):
+            cls_name = classes[c_idx]
+            if cls_name in ('normal', 'generic'):
+                continue
+            if base_val_f1[c_idx] >= 0.50:
+                continue
+            
+            # Tum mevcut modellerin probability'lerini topla
+            combined_proba = np.zeros(len(yhat_te), dtype=np.float32)
+            model_count = 0
+            for m_key in main_models:
+                p_path = cdir / f'proba_{m_key}_oof_test.npz'
+                if p_path.exists():
+                    P_m = _load_aligned(p_path, classes)
+                    combined_proba = np.maximum(combined_proba, P_m[:, c_idx])
+                    model_count += 1
+            
+            if model_count >= 2:
+                # Sadece cok guvenli thresholdlarda boostla
+                boost_mask = combined_proba >= 0.85
+                boost_count = int(np.sum(boost_mask))
+                if boost_count > 0:
+                    yhat_te[boost_mask] = c_idx
+                    _info(f"  -> BOOST: '{cls_name}' icin {boost_count} tahmin "
+                          f"combined proba >= 0.85 ile override edildi "
+                          f"(Base Val F1 cok dusuk: {base_val_f1[c_idx]:.4f})")
 
     f1s_ens = get_f1_arr(yte_enc, yhat_te, n_cls)
     macro_ens = np.mean(f1s_ens)
 
-    # --- 4. Final Result Presentation ---
+    # --- FINAL: Dinamik Sonuc Tablosu ---
     _stage("Rule-Based Ensemble Final Performance")
     print("\n" + "=" * 50)
-    print(f"| {'FINAL ENSEMBLE RESULTS (TRUSTED ROUTING)':^46} |")
+    print(f"| {'FINAL ENSEMBLE RESULTS (AUTO-ROUTING)':^46} |")
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
     print(f"| {'Class':<18} | {'F1-Score':^10} | {'Status':^10} |")
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
     
-    target_f1s = {
-        'fuzzers': 0.90, 'exploits': 0.90, 'worms': 0.90,
-        'reconnaissance': 0.98, 'shellcode': 0.98
-    }
+    # Dinamik target: medyan F1 uzerindeki siniflar "OK", altindakiler "LOW"
+    median_f1 = float(np.median(f1s_ens[f1s_ens > 0])) if np.any(f1s_ens > 0) else 0.5
 
     for i, cls in enumerate(classes):
         val = f1s_ens[i]
-        target = target_f1s.get(cls, 0.0)
-        status = "OK" if val >= target else "LOW" if target > 0 else "-"
+        status = "OK" if val >= median_f1 else "LOW" if val > 0 else "-"
         print(f"| {cls:<18} | {val:^10.4f} | {status:^10} |")
         
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
     print(f"| {'MACRO F1':<18} | {macro_ens:^10.4f} | {'SUCCESS' if macro_ens >= 0.75 else 'IN-PROG':^10} |")
     print("=" * 50)
-    _info(f"Rule-Based Ensemble achieved Macro F1: {macro_ens:.4f}")
+    _info(f"Auto-Routing Ensemble achieved Macro F1: {macro_ens:.4f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cache-dir', type=str, default='.')
+    parser.add_argument('--exclude-weak-classes', action='store_true')
     args = parser.parse_args()
-    heuristic_ensemble(args.cache_dir)
+    heuristic_ensemble(args.cache_dir, args.exclude_weak_classes)

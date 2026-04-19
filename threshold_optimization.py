@@ -86,29 +86,35 @@ def optimize_thresholds_fast(cache_dir, minority_classes, n_features=50):
             y_proba_te = (y_proba_te - y_proba_te.min()) / (y_proba_te.max() - y_proba_te.min())
             
         
-        best_f1 = 0
+        best_j = -1
         best_threshold = 0.5
-        best_precision = 0
-        best_recall = 0
+        best_f1 = 0
         
-        if minority_class == 'worms':
-            thresholds = np.arange(0.01, 0.8, 0.01)
-        else:
-            thresholds = np.arange(0.05, 0.95, 0.02)
+        # Youden's J logic
+        thresholds = np.arange(0.01, 0.99, 0.01)
+        
+        from sklearn.metrics import confusion_matrix
         
         for threshold in thresholds:
             y_pred = (y_proba_v >= threshold).astype(int)
-            if len(np.unique(y_pred)) < 2:  
-                continue
-            f1 = f1_score(y_binary_val, y_pred)
-            if f1 > best_f1:
+            tn, fp, fn, tp = confusion_matrix(y_binary_val, y_pred).ravel()
+            
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            
+            j_stat = sensitivity + specificity - 1
+            f1 = f1_score(y_binary_val, y_pred, zero_division=0)
+            
+            # Youden's J is often more robust for imbalanced binary classification
+            if j_stat > best_j:
+                best_j = j_stat
                 best_f1 = f1
                 best_threshold = threshold
-                best_precision = precision_score(y_binary_val, y_pred, zero_division=0)
-                best_recall = recall_score(y_binary_val, y_pred, zero_division=0)
+                best_precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                best_recall = sensitivity
         
-        print(f"  Optimal threshold: {best_threshold:.3f}")
-        print(f"  Optimized F1: {best_f1:.4f} P: {best_precision:.4f} R: {best_recall:.4f}")
+        print(f"  Optimal threshold (Youden's J): {best_threshold:.3f}")
+        print(f"  Result -> F1: {best_f1:.4f} P: {best_precision:.4f} R: {best_recall:.4f} J: {best_j:.4f}")
         
         threshold_path = cache_path / f'fast_threshold_{minority_class}.pkl'
         with open(threshold_path, 'wb') as f:

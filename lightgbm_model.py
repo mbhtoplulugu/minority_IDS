@@ -26,19 +26,26 @@ def _predict_proba_lgbm(model, X):
     return raw.astype(np.float32)
 
 def focal_loss_multiclass_lgbm(y_true, y_pred):
-    """Custom Multiclass Focal Loss for LightGBM"""
+    """Custom Multiclass Focal Loss for LightGBM - DYNAMIC"""
     gamma = 2.0
-    alpha = np.array([5.0, 6.0, 1.5, 1.1, 1.8, 0.8, 0.7, 1.1, 1.5, 15.0]) # Same weights as before
     
     y = y_true if not hasattr(y_true, 'get_label') else y_true.get_label()
     y = y.astype(int)
-    n_classes = 10
     
     is_1d = (y_pred.ndim == 1)
+    # LightGBM custom objective'da n_classes'i y_pred seklinden cikarmaliyiz
     if is_1d:
+        # LightGBM 1D verirse: (n_classes * n_samples)
+        n_classes = len(y_pred) // len(y)
         preds = y_pred.reshape(n_classes, -1).T
     else:
+        n_classes = y_pred.shape[1]
         preds = y_pred
+    
+    # Dinamik alpha
+    alpha = np.ones(n_classes, dtype=np.float32)
+    for i in range(n_classes):
+        alpha[i] = 2.0 # Genel saldiri agirligi
     
     p = softmax(preds, axis=1)
     y_true_oh = np.eye(n_classes)[y]
@@ -47,8 +54,7 @@ def focal_loss_multiclass_lgbm(y_true, y_pred):
     hess = p * (1.0 - p) 
     
     for i in range(n_classes):
-        alpha_factor = alpha[i] if i < len(alpha) else 1.0
-        weight_factor = alpha_factor * np.power(1.0 - p[:, i], gamma)
+        weight_factor = alpha[i] * np.power(1.0 - p[:, i], gamma)
         grad[:, i] *= weight_factor
         hess[:, i] *= weight_factor
         
@@ -64,7 +70,7 @@ def run_lgbm_oof(cfg, n_features=50, cached_data=None):
     
     # Optimize: Cache'den ykle, preprocess tekrarlanmasn
     if cached_data is not None:
-        _info("[LGBM] Using pre-loaded cached data")
+        _info(f"[LGBM] Using pre-loaded cached data with {cached_data[0].shape[1]} features")
         Xt_tr, y_tr, Xt_v, y_v, Xt_te, y_te = cached_data
     else:
         from experts import _load_cache
