@@ -432,6 +432,7 @@ def main():
     mode_group = ap.add_mutually_exclusive_group()
     mode_group.add_argument('--unsw', action='store_true', default=True, help='UNSW-NB15 modu (default)')
     mode_group.add_argument('--cicids', action='store_true', help='CICIDS17 modu')
+    mode_group.add_argument('--cicids14', action='store_true', help='CICIDS17 14 sinifli modu')
     
     ap.add_argument('--files-glob', type=str, default=None)
     ap.add_argument('--features-csv', type=str, default=None)
@@ -450,7 +451,8 @@ def main():
     ap.add_argument('--run-tabnet',   action='store_true', help='TabNet Multi-class OOF P_train uret')
     ap.add_argument('--run-autoencoder', action='store_true', help='Autoencoder modelini egit')
     ap.add_argument('--train-experts', action='store_true', help='(DEPRECATED) Eski OVR Uzmanlari egit')
-    ap.add_argument('--run-fast-experts', action='store_true', help='<0.85 F1 olan siniflar icin Hizli Binary Uzmanlari egit')
+    ap.add_argument('--run-fast-experts', action='store_true', help='(DEPRECATED) Eski hizli uzman')
+    ap.add_argument('--run-autonomous-experts', action='store_true', help='F1 skoruna gore otonom olarak Fast (<0.85) ve Surgical (<0.75) uzman atar')
     ap.add_argument('--run-stack-experts', action='store_true', help='Level-2 Meta-Model egit ve degerlendir')
     ap.add_argument('--run-heuristic-ensemble', action='store_true', help='Kural Tabanli (Heuristic) Akilli Melezleme Yap')
     ap.add_argument('--run-all',      action='store_true', help='Tum boru hattini sirayla calistir')
@@ -464,12 +466,12 @@ def main():
     args = ap.parse_args()
     
     # ===== DATASET MODE RESOLVE =====
-    dataset_mode = 'cicids' if args.cicids else 'unsw'
+    dataset_mode = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
     
-    if dataset_mode == 'cicids':
+    if dataset_mode in ('cicids', 'cicids14'):
         FILES_GLOB = ''  # CICIDS modunda kullanilmaz
         FEATURES_CSV = ''  # CICIDS modunda kullanilmaz
-        _stage("=== CICIDS17 MODU ===")
+        _stage(f"=== {'CICIDS14' if dataset_mode == 'cicids14' else 'CICIDS17'} MODU ===")
     else:
         FILES_GLOB = r"C:/Users/mbhto/source/repos/UNSW-NB15/UNSWNB15_[0-5].csv" if args.files_glob is None else args.files_glob
         FEATURES_CSV = r"C:/Users/mbhto/source/repos/UNSW-NB15/NUSW-NB15_features.csv" if args.features_csv is None else args.features_csv
@@ -493,7 +495,7 @@ def main():
     run_all = args.run_all or not any([
         args.prep_only, args.run_xgb, args.run_lgbm, args.run_lgbm_v2,
         args.run_histgb, args.run_mlp, args.run_tabnet, args.run_autoencoder, 
-        args.train_experts, args.run_fast_experts, 
+        args.train_experts, args.run_fast_experts, args.run_autonomous_experts,
         args.run_stack_experts, args.run_heuristic_ensemble
     ])
     if not args.run_all and run_all:
@@ -629,25 +631,24 @@ def main():
         _info("Skipping old legacy experts. Handled by Fast Binary Experts.")
         pass
 
-    # 5.1 Level-1 / Fast Binary Experts (Dinamik F1 Tabanli Otomatik Secim)
-    if run_all or args.run_fast_experts:
+    # 5.1 Level-1 / Autonomous Experts (Fast & Surgical)
+    if run_all or args.run_autonomous_experts or args.run_fast_experts:
         from fast_binary_expert import fast_binary_experts
         from threshold_optimization import optimize_thresholds_fast
+        from autonomous_surgical_expert import autonomous_surgical_experts
         import traceback
         from sklearn.metrics import f1_score, precision_recall_fscore_support
         
         try:
             if args.focus:
-                # Kullanici manuel olarak sinif belirttiyse onu kullan
-                focus_classes = args.focus
-                _info(f"Manual focus classes: {focus_classes}")
+                fast_classes = args.focus
+                surgical_classes = args.focus
+                _info(f"Manual focus classes: {fast_classes}")
             else:
-                # OTONOM: Base Model (XGBoost) OOF Validation F1 < 0.85 olan siniflari bul
                 _info("Auto-detecting weak classes from Base Model validation performance...")
                 le_auto = joblib.load(CACHEDIR / 'label_encoder.joblib')
                 cls_names = le_auto.classes_.astype(str)
                 
-                # Validation proba dosyasini yukle
                 xgb_val_path = CACHEDIR / 'proba_xgb_oof_valid.npz'
                 if xgb_val_path.exists():
                     y_v_auto = joblib.load(CACHEDIR / 'y_v.joblib')
@@ -658,37 +659,54 @@ def main():
                     _, _, f1_per_class, _ = precision_recall_fscore_support(
                         yv_enc, yhat_val, labels=range(len(cls_names)), zero_division=0)
                     
-                    F1_THRESHOLD = 0.85
-                    focus_classes = []
+                    FAST_THRESHOLD = 0.85
+                    SURGICAL_THRESHOLD = 0.75
+                    fast_classes = []
+                    surgical_classes = []
+                    
                     for i, c in enumerate(cls_names):
-                        if c == 'normal' or c == 'generic':  # Majority siniflar uzman gerektirmez
+                        if c == 'normal' or c == 'generic':
                             continue
-                        if f1_per_class[i] < F1_THRESHOLD:
-                            # Yeterli ornege sahip mi kontrol et (en az 10 ornek)
-                            if np.sum(yv_enc == i) >= 10:
-                                focus_classes.append(c)
-                                _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} < {F1_THRESHOLD} => EXPERT ATANACAK")
+                        
+                        f1_val = f1_per_class[i]
+                        samples = np.sum(yv_enc == i)
+                        
+                        if samples >= 10:
+                            if f1_val < SURGICAL_THRESHOLD:
+                                fast_classes.append(c)
+                                surgical_classes.append(c)
+                                _info(f"  -> [AUTONOMOUS] {c}: Val F1={f1_val:.4f} < {SURGICAL_THRESHOLD} => FAST + SURGICAL EXPERT ATANACAK")
+                            elif f1_val < FAST_THRESHOLD:
+                                fast_classes.append(c)
+                                _info(f"  -> [AUTONOMOUS] {c}: Val F1={f1_val:.4f} < {FAST_THRESHOLD} => SADECE FAST EXPERT ATANACAK")
                             else:
-                                _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} < {F1_THRESHOLD} ama ornek < 10, ATLANDI")
+                                _info(f"  -> [AUTONOMOUS] {c}: Val F1={f1_val:.4f} >= {FAST_THRESHOLD} => SAGLIKLI, UZMAN GEREKMIYOR")
                         else:
-                            _info(f"  -> {c}: Val F1={f1_per_class[i]:.4f} >= {F1_THRESHOLD} => OK, uzman gerekmiyor")
+                            _info(f"  -> [AUTONOMOUS] {c}: Val F1={f1_val:.4f} ama ornek ({samples}) < 10, ATLANDI")
                 else:
                     _info("XGBoost OOF valid proba bulunamadi, fallback: tum azinlik siniflar.")
-                    focus_classes = [c for c in cls_names if c not in ('normal', 'generic')]
+                    fast_classes = [c for c in cls_names if c not in ('normal', 'generic')]
+                    surgical_classes = fast_classes.copy()
             
-            _info(f"Final focus_classes (dynamic): {focus_classes}")
-            
-            if len(focus_classes) > 0:
-                fast_binary_experts(cache_dir=cfg.cache_dir, minority_classes=focus_classes, n_features=args.n_features)
-                optimize_thresholds_fast(cache_dir=cfg.cache_dir, minority_classes=focus_classes, n_features=args.n_features)
+            if len(fast_classes) > 0:
+                _info(f"Starting FAST EXPERT training for: {fast_classes}")
+                fast_binary_experts(cache_dir=cfg.cache_dir, minority_classes=fast_classes, n_features=args.n_features)
+                optimize_thresholds_fast(cache_dir=cfg.cache_dir, minority_classes=fast_classes, n_features=args.n_features)
             else:
-                _info("Tum saldir siniflari F1 esigini geciyor! Binary uzmanlara gerek kalmadi.")
+                _info("Hicbir sinif Fast Expert esiginin altinda degil.")
+                
+            if len(surgical_classes) > 0:
+                _info(f"Starting SURGICAL EXPERT training for: {surgical_classes}")
+                autonomous_surgical_experts(cache_dir=cfg.cache_dir, target_classes=surgical_classes, n_features=args.n_features)
+            else:
+                _info("Hicbir sinif Surgical Expert esiginin altinda degil.")
+                
         except Exception as e:
-            _info(f"Fast Binary Experts run failed: {e}")
+            _info(f"Autonomous Experts run failed: {e}")
             traceback.print_exc()
 
     # 6. Level-2 / K-Fold Meta Model Stacking
-    if args.run_stack_experts:
+    if run_all or args.run_stack_experts:
         if stack_with_experts is None:
             raise RuntimeError("stack_experts.py import edilemedi")
         focus = args.focus or ['analysis','backdoor','dos','exploits','fuzzers','reconnaissance','shellcode','worms']

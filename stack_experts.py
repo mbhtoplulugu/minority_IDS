@@ -159,26 +159,32 @@ def stack_with_experts(cache_dir: str, focus=None):
 
     # Extract all probabilities again for metrics printing
     comp_metrics = {}
+    acc_metrics = {}
 
     if xgb_test:
         P_xgb = _load_aligned(xgb_test, classes)
         comp_metrics['XGBoost'] = get_f1_per_class(P_xgb, use_argmax=True)
+        acc_metrics['XGBoost'] = accuracy_score(yt_enc, P_xgb.argmax(axis=1))
         
     if lgbm_test:
         P_lgbm = _load_aligned(lgbm_test, classes)
         comp_metrics['LightGBM'] = get_f1_per_class(P_lgbm, use_argmax=True)
+        acc_metrics['LightGBM'] = accuracy_score(yt_enc, P_lgbm.argmax(axis=1))
         
     if lgbmV2_test:
         P_lgbmV2 = _load_aligned(lgbmV2_test, classes)
         comp_metrics['LightGBM_V2'] = get_f1_per_class(P_lgbmV2, use_argmax=True)
+        acc_metrics['LightGBM_V2'] = accuracy_score(yt_enc, P_lgbmV2.argmax(axis=1))
         
     if rf_test:
         P_rf = _load_aligned(rf_test, classes)
         comp_metrics['RandomForest'] = get_f1_per_class(P_rf, use_argmax=True)
+        acc_metrics['RandomForest'] = accuracy_score(yt_enc, P_rf.argmax(axis=1))
         
     if mlp_test:
         P_mlp = _load_aligned(mlp_test, classes)
         comp_metrics['MLP'] = get_f1_per_class(P_mlp, use_argmax=True)
+        acc_metrics['MLP'] = accuracy_score(yt_enc, P_mlp.argmax(axis=1))
         
     for cls in focus:
         if cls not in classes: continue
@@ -187,8 +193,10 @@ def stack_with_experts(cache_dir: str, focus=None):
             P_exp = _load_aligned(te_p, classes)
             # Experts are binary, argmax won't work perfectly but it's just for display
             comp_metrics[f'Expert ({cls})'] = get_f1_per_class(P_exp, use_argmax=True)
+            acc_metrics[f'Expert ({cls})'] = accuracy_score(yt_enc, P_exp.argmax(axis=1))
 
     comp_metrics['Meta-Model (Ensemble)'] = get_f1_per_class(Pt_ensemble)
+    acc_metrics['Meta-Model (Ensemble)'] = accuracy_score(yt_enc, Pt_ensemble.argmax(axis=1))
 
     print("\n" + "="*80)
     print(f"{'Class':<15} |", end="")
@@ -209,6 +217,12 @@ def stack_with_experts(cache_dir: str, focus=None):
     for m in model_names:
         mac = np.mean(comp_metrics[m])
         print(f" {mac:.4f}{' '*8} |", end="")
+    print("\n" + "-"*80)
+    
+    print(f"{'Accuracy':<15} |", end="")
+    for m in model_names:
+        acc = acc_metrics[m]
+        print(f" {acc:.4f}{' '*8} |", end="")
     print("\n" + "="*80 + "\n")
     
     # Save Meta Model Predictions
@@ -219,10 +233,21 @@ def stack_with_experts(cache_dir: str, focus=None):
 
 def main():
     ap = argparse.ArgumentParser(description='Level-2 OOF Stacking Meta-Classifier')
+    mode_group = ap.add_mutually_exclusive_group()
+    mode_group.add_argument('--unsw', action='store_true', default=True, help='UNSW-NB15 modu (default)')
+    mode_group.add_argument('--cicids', action='store_true', help='CICIDS17 modu')
+    mode_group.add_argument('--cicids14', action='store_true', help='CICIDS17 14 sinifli modu')
+    
     ap.add_argument('--cache-dir', type=str, default='.')
+    ap.add_argument('--exclude-weak-classes', action='store_true')
     ap.add_argument('--focus', nargs='*', default=['analysis','backdoor','dos','exploits','fuzzers','reconnaissance','shellcode','worms'])
     args = ap.parse_args()
-    stack_with_experts(cache_dir=args.cache_dir, focus=args.focus)
+    
+    dataset_mode = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
+    cache_mode_name = dataset_mode + "_excluded" if args.exclude_weak_classes else dataset_mode
+    target_cache_dir = Path(args.cache_dir) / cache_mode_name
+    
+    stack_with_experts(cache_dir=str(target_cache_dir), focus=args.focus)
 
 if __name__ == '__main__':
     main()

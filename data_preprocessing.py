@@ -49,40 +49,54 @@ def _info(msg: str):  print(f"[Info]  {msg}")
 #   ackdat-> tcp_ack_syn_ratio
 #   swin/dwin -> (henuz kullanilmiyor ama potansiyel)
 #   smean/dmean -> (henuz kullanilmiyor ama semantik dogru)
+#
+# CICIDS17 PROXY NOTLARI:
+#   dpkts  <- 'Bwd Packets/s' * dur ile hesaplanabilir ama CSV'de dogrudan yok.
+#             feature_engineering_fixed.py icinde CICIDS icin dpkts yoksa
+#             'Bwd Packets/s' x dur proxy kullanilir (asagida post-processing).
+#   dbytes <- 'Bwd Packet Length Mean' * dpkts_proxy ile hesaplanabilir (post-processing).
+#   sjit   <- CICIDS'de 'Fwd IAT Total' yok; 'Fwd IAT Std' en iyi proxy.
+#   djit   <- 'Bwd IAT Total' mevcut, dogrudan eslenir.
+#   sttl, dttl <- CICIDS'de TTL kaydedilmez; Header Length semantik proxy.
+#                 ttl_asymmetry bu veri setinde hesaplanamaz.
+#   srcip, sport <- CICIDS preprocessed CSV'sinde yok; src_port_entropy hesaplanamaz.
 GLOBAL_COL_MAP = {
     # === Temel Akis Ozellikleri (Feature Engineering icin KRITIK) ===
-    'Flow Duration': 'dur',
-    'Total Fwd Packets': 'spkts',
-    'Total Backward Packets': 'dpkts',
-    'Total Length of Fwd Packets': 'sbytes',
-    'Total Length of Bwd Packets': 'dbytes',
-    'Destination Port': 'dsport',
+    'Flow Duration':                  'dur',
+    'Total Fwd Packets':              'spkts',
+    # dpkts CICIDS CSV'sinde yok — feature_engineering icinde proxy ile uretilir
+    'Total Length of Fwd Packets':    'sbytes',
+    # dbytes CICIDS CSV'sinde yok — feature_engineering icinde proxy ile uretilir
+    'Destination Port':               'dsport',
     # === Paket Boyut Istatistikleri ===
-    'Fwd Packet Length Mean': 'smean',
-    'Bwd Packet Length Mean': 'dmean',
+    'Fwd Packet Length Mean':         'smean',
+    'Bwd Packet Length Mean':         'dmean',
     # === Hiz / Oran ===
-    'Flow Bytes/s': 'rate',
-    'Flow Packets/s': 'srate',
-    # === Inter-Arrival Time (Jitter kaynaklari) ===
-    'Flow IAT Mean': 'sinpkt',
-    'Flow IAT Std': 'dinpkt',
-    'Fwd IAT Total': 'sjit',
-    'Bwd IAT Total': 'djit',
+    'Flow Bytes/s':                   'rate',
+    'Flow Packets/s':                 'srate',
+    'Bwd Packets/s':                  'bwd_pkt_rate',  # dpkts proxy hesabinda kullanilir
+    # === Inter-Arrival Time ===
+    'Flow IAT Mean':                  'sinpkt',
+    'Flow IAT Std':                   'dinpkt',
+    # Fwd IAT Std: sjit proxy (Fwd IAT Total CICIDS'de yok)
+    'Fwd IAT Std':                    'sjit',
+    # Bwd IAT Total: djit dogrudan eslesir
+    'Bwd IAT Total':                  'djit',
     # === Pencere Boyutlari ===
-    'Init_Win_bytes_forward': 'swin',
-    'Init_Win_bytes_backward': 'dwin',
-    # === Header / TTL (CICIDS'de tam TTL yok, Header Length en yakin proxy) ===
-    'Fwd Header Length': 'sttl',
-    'Bwd Header Length': 'dttl',
-    # === Paket Kayip Proxy (CICIDS'de sloss/dloss yok, min/max packet en yakin proxy) ===
-    'Min Packet Length': 'sloss',
-    'Max Packet Length': 'dloss',
-    # === TCP Zamanlama Proxyleri (CICIDS'de tcprtt/synack/ackdat yok, Active * en yakin proxy) ===
-    'Active Mean': 'tcprtt',
-    'Active Std': 'synack',
-    'Active Max': 'ackdat',
+    'Init_Win_bytes_forward':         'swin',
+    'Init_Win_bytes_backward':        'dwin',
+    # === Header Length (TTL proxy — semantik olarak tam degil ama en yakin) ===
+    'Fwd Header Length':              'sttl',
+    'Bwd Header Length':              'dttl',
+    # === Paket Kayip Proxy ===
+    'Min Packet Length':              'sloss',
+    'Max Packet Length':              'dloss',
+    # === TCP Zamanlama Proxyleri ===
+    'Active Mean':                    'tcprtt',
+    'Active Std':                     'synack',
+    'Active Max':                     'ackdat',
     # === Hedef Degisken ===
-    'Label': 'attack_cat',
+    'Label':                          'attack_cat',
 }
 
 def _as_f32(x: np.ndarray) -> np.ndarray:
@@ -122,9 +136,9 @@ class DPConfig:
     cast_float32: bool = True
     group_key: str|None = None
     # ===== DUAL-MODE DATASET SECIMI =====
-    dataset_mode: str = 'unsw'    # 'unsw' veya 'cicids'
-    train_csv: str|None = None    # CICIDS modu icin: cicids_train.csv yolu
-    test_csv: str|None = None     # CICIDS modu icin: cicids_test.csv yolu
+    dataset_mode: str = 'unsw'    # 'unsw', 'cicids' veya 'cicids14'
+    train_csv: str|None = None    # CICIDS/CICIDS14 modu icin train CSV yolu
+    test_csv: str|None = None     # CICIDS/CICIDS14 modu icin test CSV yolu
     exclude_weak: bool = False    # Zayif siniflari veri setinden tamamen cikarir
 
 _CANON = {
@@ -234,9 +248,11 @@ def save_all_features(df: pd.DataFrame, cache_dir: str):
     _info(f"Tm kolonlar kaydedildi: {len(all_cols)} kolon")
 def _read_feature_list(features_csv: str) -> List[str]:
     """
-    zellik isimlerini features.csv'den okur.
-    - CSV'de 'Name' veya ilk stun zellik adlarn iersin.
-    - Hedef kolon (attack_cat) listede olsa bile training'de karlr.
+    Ozellik isimlerini features.csv'den okur.
+    - CSV'de 'Name' veya ilk sutun ozellik adlarini icersin.
+    - Hedef kolon (attack_cat) listede olsa bile training'de karilir.
+    - Kolon adlari normalize edilir (lowercase, strip, bosluksuz) —
+      ham CSV kolonlariyla (_normalize_colnames ile atanmis) eslesmesi icin.
     """
     fdf = pd.read_csv(features_csv, encoding='cp1252')  # Windows encoding
     if "Name" in fdf.columns:
@@ -244,6 +260,8 @@ def _read_feature_list(features_csv: str) -> List[str]:
     else:
         cols = fdf.iloc[:, 0].astype(str).tolist()
     cols = [c for c in cols if isinstance(c, str) and len(c)]
+    # Ham CSV ile ayni normalizasyonu uygula: lowercase + strip + bosluklari kaldir
+    cols = _normalize_colnames(cols)
     return cols
 
 # ---------- core preprocess ----------
@@ -317,8 +335,8 @@ def _fit_transform_cache(df: pd.DataFrame, cfg: DPConfig) -> Tuple[np.ndarray, n
 
     # hedef al
     y_all = df[target].astype(str).values
-    # zellik listesi - CICIDS modunda features_csv olmayabilir, CSV kolonlarindan cikar
-    if cfg.dataset_mode == 'cicids' or not cfg.features_csv or not Path(cfg.features_csv).exists():
+    # zellik listesi - CICIDS/CICIDS14 modunda features_csv olmayabilir, CSV kolonlarindan cikar
+    if cfg.dataset_mode in ('cicids', 'cicids14') or not cfg.features_csv or not Path(cfg.features_csv).exists():
         feature_cols = [c for c in df.columns if c not in (target, 'label', 'Label')]
         _info(f"Feature list auto-detected from DataFrame: {len(feature_cols)} features")
     else:
@@ -546,13 +564,18 @@ def ensure_preprocessed(cfg: DPConfig):
         return Xt_tr, y_tr, Xt_v, y_v, Xt_te, y_te, le
 
     # --- Hamdan uretim ---
-    if cfg.dataset_mode == 'cicids':
+    if cfg.dataset_mode in ('cicids', 'cicids14'):
         # ===== CICIDS MODU =====
-        _stage("CICIDS17 modu: hazir CSV'lerden yukleniyor")
-        train_csv = cfg.train_csv or (str(Path('cicids_train.csv')) if Path('cicids_train.csv').exists() else str(cdir / 'cicids_train.csv'))
-        test_csv = cfg.test_csv or (str(Path('cicids_test.csv')) if Path('cicids_test.csv').exists() else str(cdir / 'cicids_test.csv'))
+        is_14 = (cfg.dataset_mode == 'cicids14')
+        _stage(f"{'CICIDS14' if is_14 else 'CICIDS17'} modu: hazir CSV'lerden yukleniyor")
         
-        raw_df_cache = cdir / 'raw_df_cicids.joblib'
+        default_train = 'cicids14_train.csv' if is_14 else 'cicids_train.csv'
+        default_test = 'cicids14_test.csv' if is_14 else 'cicids_test.csv'
+        
+        train_csv = cfg.train_csv or (str(Path(default_train)) if Path(default_train).exists() else str(cdir / default_train))
+        test_csv = cfg.test_csv or (str(Path(default_test)) if Path(default_test).exists() else str(cdir / default_test))
+        
+        raw_df_cache = cdir / f'raw_df_{cfg.dataset_mode}.joblib'
         if raw_df_cache.exists():
             df_all = joblib.load(raw_df_cache)
             _info(f"CICIDS raw_df cache yuklendi: {df_all.shape}")
@@ -595,6 +618,7 @@ if __name__ == "__main__":
     mode_group = ap.add_mutually_exclusive_group()
     mode_group.add_argument("--unsw", action="store_true", default=True, help="UNSW-NB15 modu (default)")
     mode_group.add_argument("--cicids", action="store_true", help="CICIDS17 modu")
+    mode_group.add_argument("--cicids14", action="store_true", help="CICIDS17 14 sinifli modu")
     # UNSW arguments
     ap.add_argument("--files-glob", type=str, default="C:/Users/mbhto/source/repos/UNSW-NB15/UNSWNB15_[0-5].csv")
     ap.add_argument("--features-csv", type=str, default="C:/Users/mbhto/source/repos/UNSW-NB15/NUSW-NB15_features.csv")
@@ -612,7 +636,7 @@ if __name__ == "__main__":
     ap.add_argument("--exclude-weak-classes", action="store_true")
     args = ap.parse_args()
 
-    dataset_mode = 'cicids' if args.cicids else 'unsw'
+    dataset_mode = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
     cache_mode_name = dataset_mode + "_excluded" if args.exclude_weak_classes else dataset_mode
 
     cfg = DPConfig(

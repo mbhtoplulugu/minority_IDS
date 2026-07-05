@@ -26,37 +26,37 @@ def _stage(m): print(f"[Stage] {m}")
 CICIDS_LABEL_MAP = {
     'BENIGN': 'normal',
     'Bot': 'bot',
-    'DDoS': 'dos',
-    'DoS Hulk': 'dos',
-    'DoS GoldenEye': 'dos',
-    'DoS slowloris': 'dos',
-    'DoS Slowhttptest': 'dos',
+    'DDoS': 'ddos',
+    'DoS Hulk': 'dos_hulk',
+    'DoS GoldenEye': 'dos_goldeneye',
+    'DoS slowloris': 'dos_slowloris',
+    'DoS Slowhttptest': 'dos_slowhttptest',
     'Heartbleed': 'heartbleed',
     'Infiltration': 'infiltration',
     'PortScan': 'portscan',
-    'FTP-Patator': 'bruteforce',
-    'SSH-Patator': 'bruteforce',
+    'FTP-Patator': 'ftp_patator',
+    'SSH-Patator': 'ssh_patator',
 }
 
 def _canon_cicids_label(s: str) -> str:
-    """CICIDS17 etiketlerini kanonik isimlere donusturur."""
+    """CICIDS17 etiketlerini 14 sınıflı modda kanonik isimlere donusturur."""
     if not isinstance(s, str):
         s = str(s)
     s = s.strip()
     # Exact match dene
     if s in CICIDS_LABEL_MAP:
         return CICIDS_LABEL_MAP[s]
-    # Web Attack varyantlari (bozuk karakterli)
+    # Web Attack varyantlari
     s_lower = s.lower()
     if 'web attack' in s_lower and 'brute' in s_lower:
-        return 'bruteforce'
+        return 'web_attack_brute'
     if 'web attack' in s_lower and 'xss' in s_lower:
-        return 'xss'
+        return 'web_attack_xss'
     if 'web attack' in s_lower and 'sql' in s_lower:
-        return 'sql_injection'
+        return 'web_attack_sql'
     # Genel regex temizlik
     cleaned = re.sub(r'[^a-zA-Z0-9 ]', ' ', s).strip().lower()
-    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', '_', cleaned)
     if cleaned in ('benign', 'normal', ''): return 'normal'
     return cleaned
 
@@ -370,8 +370,8 @@ def split_and_save(df: pd.DataFrame, output_dir: str, test_ratio: float = 0.30,
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    train_path = out_dir / 'cicids_train.csv'
-    test_path = out_dir / 'cicids_test.csv'
+    train_path = out_dir / 'cicids14_train.csv'
+    test_path = out_dir / 'cicids14_test.csv'
     
     _info(f"  Saving {train_path}...")
     df_train.to_csv(train_path, index=False)
@@ -441,7 +441,7 @@ def run_cicids_preprocessing(input_dir: str, output_dir: str,
     elapsed = time.time() - t0
     print("\n" + "=" * 70)
     print(f"  CICIDS17 PREPROCESSING COMPLETE ({elapsed:.1f}s)")
-    print(f"  Output: {output_dir}/cicids_train.csv, cicids_test.csv")
+    print(f"  Output: {output_dir}/cicids14_train.csv, cicids14_test.csv")
     print(f"  Features: {len(df.columns) - 1} | Classes: {df['attack_cat'].nunique()}")
     print("=" * 70)
     
