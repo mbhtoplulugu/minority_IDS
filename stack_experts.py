@@ -40,18 +40,34 @@ def stack_with_experts(cache_dir: str, focus=None):
     cdir = Path(cache_dir)
     le = joblib.load(cdir/'label_encoder.joblib')
     classes = le.classes_.astype(str)
-    focus = focus or ['analysis','backdoor','dos','exploits','fuzzers','reconnaissance','shellcode','worms']
-    cdir = Path(cache_dir)
-    le = joblib.load(cdir/'label_encoder.joblib')
-    classes = le.classes_.astype(str)
-    focus = focus or ['analysis','backdoor','dos','exploits','fuzzers','reconnaissance','shellcode','worms']
+
+    if focus is not None:
+        focus = [str(c) for c in focus if str(c) in classes]
+        if focus:
+            _info(f"Using requested expert classes: {focus}")
+        else:
+            _info("Requested expert classes did not match known classes; stacking base models only.")
+    else:
+        # Auto-detect expert classes from available OOF files — dataset agnostic.
+        # Scans for proba_expert_<cls>_oof_train.npz and extracts <cls> from the name.
+        focus = sorted({
+            p.stem
+            .replace('proba_expert_', '')
+            .replace('_oof_train', '')
+            for p in cdir.glob('proba_expert_*_oof_train.npz')
+        } & set(classes))  # only keep classes the label encoder knows
+
+        if focus:
+            _info(f"Auto-detected expert classes: {focus}")
+        else:
+            _info("No expert OOF files found — stacking base models only.")
 
     y_tr = joblib.load(cdir/'y_tr.joblib')
-    y_v = joblib.load(cdir/'y_v.joblib')
+    y_v  = joblib.load(cdir/'y_v.joblib')
     y_te = joblib.load(cdir/'y_te.joblib')
     ytr_enc = le.transform(np.asarray(y_tr))
-    yv_enc = le.transform(np.asarray(y_v))
-    yt_enc = le.transform(np.asarray(y_te))
+    yv_enc  = le.transform(np.asarray(y_v))
+    yt_enc  = le.transform(np.asarray(y_te))
 
     _stage("Assembling Level-1 OOF Features")
     
@@ -140,10 +156,27 @@ def stack_with_experts(cache_dir: str, focus=None):
 
     _info(f"Loaded Level-1 Models and Experts. Meta-Train Shape: {X_meta_tr.shape}")
 
-    _stage("Training Meta-Model (Logistic Regression Standard)")
-    meta_model = LogisticRegression(max_iter=2000, multi_class='multinomial', solver='lbfgs', C=1.0)
+    # Diagnostic: show per-class sample counts so starvation is visible
+    _stage("Meta-Train Class Distribution")
+    unique_cls, counts = np.unique(ytr_enc, return_counts=True)
+    for ci, cnt in zip(unique_cls, counts):
+        flag = "  <<< STARVED" if cnt < 10 else ""
+        _info(f"  {classes[ci]:<30} {cnt:>6} samples{flag}")
+
+    _stage("Training Meta-Model (Logistic Regression + Balanced Weights)")
+    # class_weight='balanced' is critical: without it, rare classes (heartbleed,
+    # infiltration, web attack sql) are overwhelmed by majority classes and the
+    # LR never picks them as argmax → F1=0.
+    # C=4.0 relaxes regularisation slightly so minority-class weights can be learned.
+    meta_model = LogisticRegression(
+        max_iter=5000,
+        multi_class='multinomial',
+        solver='lbfgs',
+        C=4.0,
+        class_weight='balanced',
+    )
     meta_model.fit(X_meta_tr, ytr_enc)
-    
+
     Pv_ensemble = meta_model.predict_proba(X_meta_v)
     Pt_ensemble = meta_model.predict_proba(X_meta_te)
 
@@ -186,12 +219,10 @@ def stack_with_experts(cache_dir: str, focus=None):
         comp_metrics['MLP'] = get_f1_per_class(P_mlp, use_argmax=True)
         acc_metrics['MLP'] = accuracy_score(yt_enc, P_mlp.argmax(axis=1))
         
-    for cls in focus:
-        if cls not in classes: continue
+    for cls in focus:  # focus is already auto-detected and validated against classes
         te_p = cdir/f"proba_expert_{cls}_oof_test.npz"
         if te_p.exists():
             P_exp = _load_aligned(te_p, classes)
-            # Experts are binary, argmax won't work perfectly but it's just for display
             comp_metrics[f'Expert ({cls})'] = get_f1_per_class(P_exp, use_argmax=True)
             acc_metrics[f'Expert ({cls})'] = accuracy_score(yt_enc, P_exp.argmax(axis=1))
 
@@ -234,19 +265,19 @@ def stack_with_experts(cache_dir: str, focus=None):
 def main():
     ap = argparse.ArgumentParser(description='Level-2 OOF Stacking Meta-Classifier')
     mode_group = ap.add_mutually_exclusive_group()
-    mode_group.add_argument('--unsw', action='store_true', default=True, help='UNSW-NB15 modu (default)')
-    mode_group.add_argument('--cicids', action='store_true', help='CICIDS17 modu')
+    mode_group.add_argument('--unsw',     action='store_true', default=True, help='UNSW-NB15 modu (default)')
+    mode_group.add_argument('--cicids',   action='store_true', help='CICIDS17 modu')
     mode_group.add_argument('--cicids14', action='store_true', help='CICIDS17 14 sinifli modu')
-    
+
     ap.add_argument('--cache-dir', type=str, default='.')
     ap.add_argument('--exclude-weak-classes', action='store_true')
-    ap.add_argument('--focus', nargs='*', default=['analysis','backdoor','dos','exploits','fuzzers','reconnaissance','shellcode','worms'])
+    ap.add_argument('--focus', nargs='*', default=None, help='Optional expert classes to include in stacking')
     args = ap.parse_args()
-    
-    dataset_mode = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
+
+    dataset_mode    = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
     cache_mode_name = dataset_mode + "_excluded" if args.exclude_weak_classes else dataset_mode
     target_cache_dir = Path(args.cache_dir) / cache_mode_name
-    
+
     stack_with_experts(cache_dir=str(target_cache_dir), focus=args.focus)
 
 if __name__ == '__main__':

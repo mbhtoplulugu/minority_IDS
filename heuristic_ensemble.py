@@ -150,9 +150,17 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     if not dummy_path.exists():
         # Fallback if xgb doesn't exist
         for m in main_models:
-            if (cdir / f'proba_{m}_oof_test.npz').exists():
-                dummy_path = cdir / f'proba_{m}_oof_test.npz'
+            candidate = cdir / f'proba_{m}_oof_test.npz'
+            if candidate.exists():
+                dummy_path = candidate
                 break
+        else:
+            existing = [f.name for f in cdir.iterdir()] if cdir.exists() else []
+            raise RuntimeError(
+                f"No model probability files (proba_*_oof_test.npz) found in '{cdir}'.\n"
+                f"Run the individual model training scripts first to generate OOF predictions.\n"
+                f"Files currently in '{cdir}':\n  " + "\n  ".join(existing or ["(directory is empty or missing)"])
+            )
 
     dummy_P = _load_aligned(dummy_path, classes)
     
@@ -175,21 +183,19 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     _stage("Applying Autonomous Surgical Overrides (Validation-Gated)")
     
     # Phase A: Surgical Binary Expert Override
-    for expert_pkl in sorted(cdir.glob('surgical_*_expert.pkl')):
-        cls_name = expert_pkl.stem.replace('surgical_', '').replace('_expert', '')
-        thresh_path = cdir / f'surgical_{cls_name}_threshold.pkl'
-        proba_path = cdir / f'proba_surgical_{cls_name}_oof_test.npz'
-        proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
-        
-        if not (thresh_path.exists() and proba_path.exists()):
-            continue
+    for expert_proba_path in sorted(cdir.glob('proba_surgical_*_oof_test.npz')):
+        cls_name = expert_proba_path.stem.replace('proba_surgical_', '').replace('_oof_test', '').replace('_expert', '')
         if cls_name not in classes:
             continue
             
+        thresh_path = cdir / f'surgical_{cls_name}_threshold.pkl'
+        proba_path = expert_proba_path
+        proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
+        
         c_idx = int(np.where(classes == cls_name)[0][0])
         apply_override = True
         
-        # Verify on validation set against Soft Voting consensus
+        # Verify on validation set against Soft Voting consensus with Precision Safeguard
         if proba_val_path.exists():
             P_surg_val = _load_aligned(proba_val_path, classes)
             with open(thresh_path, 'rb') as f:
@@ -198,11 +204,15 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
             temp_val = base_val_preds.copy()
             surg_val_mask = P_surg_val[:, c_idx] >= opt_thresh
             temp_val[surg_val_mask] = c_idx
-            mixed_f1 = get_f1_arr(yv_enc, temp_val, n_cls)
             
-            # The surgical expert is only applied if it strictly improves the consensus F1
-            if np.mean(mixed_f1) <= np.mean(base_val_f1):
-                _info(f"  -> {cls_name}: Surgical expert BYPASSED (No Macro F1 improvement over consensus)")
+            prec_base, _, f1_base_arr, _ = precision_recall_fscore_support(yv_enc, base_val_preds, average=None, zero_division=0)
+            prec_new, _, f1_new_arr, _ = precision_recall_fscore_support(yv_enc, temp_val, average=None, zero_division=0)
+            
+            target_improved = f1_new_arr[c_idx] > f1_base_arr[c_idx]
+            precision_safeguard = np.all(prec_new >= 0.97 * prec_base)
+            
+            if not (target_improved and precision_safeguard):
+                _info(f"  -> {cls_name}: Surgical expert BYPASSED (Failed Precision Safeguard or F1 Improvement)")
                 apply_override = False
         
         if apply_override:
@@ -217,11 +227,10 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
 
     # Phase A.2: Fast Binary Expert Override
     for expert_val_path in sorted(cdir.glob('proba_fast_expert_*_oof_valid.npz')):
-        m_key = expert_val_path.stem.replace('proba_', '').replace('_oof_valid', '')
-        cls_name = m_key.replace('fast_expert_', '')
+        cls_name = expert_val_path.stem.replace('proba_fast_expert_', '').replace('_oof_valid', '')
         if cls_name not in classes: continue
         
-        expert_test_path = cdir / f'proba_{m_key}_oof_test.npz'
+        expert_test_path = cdir / f'proba_fast_expert_{cls_name}_oof_test.npz'
         if not expert_test_path.exists(): continue
         
         c_idx = int(np.where(classes == cls_name)[0][0])
@@ -240,10 +249,15 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
         temp_val = base_val_preds.copy()
         fe_val_mask = P_fe_val[:, c_idx] >= opt_thresh
         temp_val[fe_val_mask] = c_idx
-        mixed_f1 = get_f1_arr(yv_enc, temp_val, n_cls)
         
-        if np.mean(mixed_f1) <= np.mean(base_val_f1):
-            _info(f"  -> {cls_name}: Fast expert BYPASSED (No Macro F1 improvement over consensus)")
+        prec_base, _, f1_base_arr, _ = precision_recall_fscore_support(yv_enc, base_val_preds, average=None, zero_division=0)
+        prec_new, _, f1_new_arr, _ = precision_recall_fscore_support(yv_enc, temp_val, average=None, zero_division=0)
+        
+        target_improved = f1_new_arr[c_idx] > f1_base_arr[c_idx]
+        precision_safeguard = np.all(prec_new >= 0.97 * prec_base)
+        
+        if not (target_improved and precision_safeguard):
+            _info(f"  -> {cls_name}: Fast expert BYPASSED (Failed Precision Safeguard or F1 Improvement)")
         else:
             P_fe_te = _load_aligned(expert_test_path, classes)
             fe_test_mask = P_fe_te[:, c_idx] >= opt_thresh

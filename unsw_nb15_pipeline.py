@@ -219,7 +219,7 @@ def apply_smart_resampling(X: np.ndarray, y, cfg: Config):
     X_res, y_res = tl.fit_resample(X_res, y_res)
     y_res = _as_series(y_res)
     _print_dist('train.after_tomek', y_res)
-
+    X_final, y_final = X_res, y_res
     # 3. Oversample (Ar kkleri ykselt)
     min_samples = 8000
     vc2 = y_res.value_counts()
