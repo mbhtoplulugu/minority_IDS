@@ -178,6 +178,41 @@ def ct_transform(ct, df: pd.DataFrame, feature_cols: list) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
+def build_raw_imputed(df_train: pd.DataFrame, df_test: pd.DataFrame,
+                      feature_cols: list) -> tuple:
+    """
+    Stage 0: yalnızca imputation + ordinal encoding — ölçekleme yok.
+    Zayıf ablasyon tabanı; normalize/feature eng etkisini göstermek için.
+    """
+    X_tr = df_train[feature_cols]
+    cat_cols = X_tr.select_dtypes(include=["object", "category"]).columns.tolist()
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+
+    num_pipe = SkPipeline([("impute", SimpleImputer(strategy="median"))])
+    cat_pipe = SkPipeline([
+        ("impute", SimpleImputer(strategy="most_frequent")),
+        ("ord",    OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
+    ])
+
+    transformers = []
+    if num_cols:
+        transformers.append(("num", num_pipe, num_cols))
+    if cat_cols:
+        transformers.append(("cat", cat_pipe, cat_cols))
+
+    ct_raw = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        sparse_threshold=0.0,
+    )
+    ct_raw.fit(df_train[feature_cols])
+    ordered_names = num_cols + cat_cols
+
+    X_tr_out = ct_transform(ct_raw, df_train, feature_cols)
+    X_te_out = ct_transform(ct_raw, df_test, feature_cols)
+    return X_tr_out, X_te_out, ordered_names
+
+
 # ─── Mühendislik Özellikleri ──────────────────────────────────────────────────
 
 def add_engineered_features(X_norm: np.ndarray, feat_names: list,
@@ -429,26 +464,34 @@ def save_stage(stage_dir: Path, ds_name: str, stage_name: str, desc: str,
 
 # ─── 5 Aşama Üretici ─────────────────────────────────────────────────────────
 
-def run_stages(X_tr_norm: np.ndarray, y_tr: np.ndarray,
-               X_te_norm: np.ndarray, y_te: np.ndarray,
+def run_stages(X_tr_raw: np.ndarray, X_te_raw: np.ndarray,
+               feat_names_raw: list,
+               X_tr_norm: np.ndarray, X_te_norm: np.ndarray,
+               y_tr: np.ndarray, y_te: np.ndarray,
                le: LabelEncoder, feat_names: list,
                ds_name: str, out_path: Path,
                n_select: int = 75,
-               strategy: str = "full"):
+               strategy: str = "full",
+               smote_min: int = 8000):
     """
-    Normalize edilmiş train/test array'lerinden 5 ablasyon aşaması üretir.
+    Ham + normalize edilmiş train/test array'lerinden 6 ablasyon aşaması üretir.
 
-    n_select : Stage B SelectKBest k değeri.
-    strategy : Resampling stratejisi.
-        "full"      — RUS → Tomek(not_minority) → SMOTE  [mevcut davranış]
-        "rus_only"  — RUS, Tomek yok, SMOTE yok
-                      Stage D = Stage C kopyası, Stage E = Stage C kopyası
-        "rus_smote" — RUS → Tomek(majority_only, min_cls>=50) → SMOTE
-                      Tomek sadece majority sınıfını temizler,
-                      <50 örnekli sınıf varsa Tomek tamamen atlanır
+    n_select  : Stage B SelectKBest k değeri.
+    smote_min : pipeline_replica / rus_smote SMOTE alt sınırı (varsayılan 8000).
+    strategy  : Resampling stratejisi.
+        "full"              — RUS → Tomek(not_minority) → SMOTE(median×2)  [eski]
+        "pipeline_replica"  — RUS → Tomek(majority) → SMOTE(min=smote_min)  [pipeline ile hizalı]
+        "rus_only"          — RUS, Tomek yok, SMOTE yok
+        "rus_smote"         — RUS → Tomek(majority) → SMOTE(median×2)
     """
-    _info(f"[{ds_name}] Strateji: {strategy}")
-    n_orig = X_tr_norm.shape[1]
+    _info(f"[{ds_name}] Strateji: {strategy} (smote_min={smote_min})")
+
+    # ── Aşama 0: Ham (impute + encode, ölçekleme yok) ───────────────────────
+    _info(f"[{ds_name}] Aşama 0: Ham (ölçeklenmemiş)")
+    save_stage(out_path / "stage_0_raw",
+               ds_name, "stage_0_raw",
+               "Imputation + OrdinalEncoder (ölçekleme yok)",
+               X_tr_raw, y_tr, X_te_raw, y_te, le, feat_names_raw)
 
     # ── Aşama A: Normalized ──────────────────────────────────────────────────
     _info(f"[{ds_name}] Aşama A: Normalized")
@@ -510,7 +553,7 @@ def run_stages(X_tr_norm: np.ndarray, y_tr: np.ndarray,
         X_tr_tomek, y_tr_tomek = X_tr_rus.copy(), y_tr_rus.copy()
         tomek_desc = "C kopyası (rus_only stratejisi)"
 
-    elif strategy == "rus_smote":
+    elif strategy in ("rus_smote", "pipeline_replica"):
         # Tomek: sadece majority sınıfı temizle, <50 örnekli sınıf varsa atla
         TOMEK_MIN_CLS = 50
         if min_cls_d < TOMEK_MIN_CLS:
@@ -549,6 +592,25 @@ def run_stages(X_tr_norm: np.ndarray, y_tr: np.ndarray,
         X_tr_smote, y_tr_smote = X_tr_rus.copy(), y_tr_rus.copy()
         smote_desc = "C kopyası (rus_only stratejisi)"
 
+    elif strategy == "pipeline_replica":
+        # Pipeline ile birebir: her sınıf en az smote_min örneğe çıkarılır
+        over_dict = {c: max(int(cnt), smote_min) for c, cnt in vc_e.items()}
+        needs_smote = any(int(cnt) < smote_min for cnt in vc_e.values)
+        if not needs_smote:
+            _info(f"  SMOTE atlandı (tüm sınıflar ≥ {smote_min}), D kopyalanıyor")
+            X_tr_smote, y_tr_smote = X_tr_tomek.copy(), y_tr_tomek.copy()
+            smote_desc = f"D kopyası (≥{smote_min})"
+        elif min_cnt_e < 2:
+            _info(f"  SMOTE atlandı (min sınıf={min_cnt_e} < 2), D kopyalanıyor")
+            X_tr_smote, y_tr_smote = X_tr_tomek.copy(), y_tr_tomek.copy()
+            smote_desc = "D kopyası (min_cls<2)"
+        else:
+            k_sm = max(1, min(3, min_cnt_e - 1))
+            smote = SMOTE(sampling_strategy=over_dict, k_neighbors=k_sm, random_state=42)
+            X_tr_smote, y_tr_smote = smote.fit_resample(X_tr_tomek, y_tr_tomek)
+            smote_desc = f"D + SMOTE(min={smote_min}, k={k_sm})"
+            _info(f"  SMOTE(pipeline): {len(y_tr_tomek):,} → {len(y_tr_smote):,}")
+
     else:  # "full" veya "rus_smote"
         over_dict = {}
         for c, cnt in vc_e.items():
@@ -582,9 +644,15 @@ def run_stages(X_tr_norm: np.ndarray, y_tr: np.ndarray,
 def prepare_unsw(out_dir: Path, files_glob: str = UNSW_FILES_GLOB,
                  features_csv: str = UNSW_FEATURES_CSV,
                  random_state: int = 42, test_size: float = 0.20,
-                 n_select: int = 75, strategy: str = "full"):
+                 n_select: int = 75, strategy: str = "full",
+                 smote_min: int = 8000):
     _stage("UNSW-NB15 HAZIRLANIYOR")
-    folder_name = "unsw" if strategy == "full" else f"unsw_{strategy}"
+    if strategy == "full":
+        folder_name = "unsw"
+    elif strategy == "pipeline_replica":
+        folder_name = "unsw_pipeline"
+    else:
+        folder_name = f"unsw_{strategy}"
     out_path = out_dir / folder_name
 
     # ── 1. CSV'leri bul ve birleştir ─────────────────────────────────────────
@@ -676,15 +744,23 @@ def prepare_unsw(out_dir: Path, files_glob: str = UNSW_FILES_GLOB,
     )
     _info(f"Split: train={len(X_tr_df)}, test={len(X_te_df)}")
 
-    # ── 6. ColumnTransformer pipeline (train'de fit, test'e transform) ────────
+    # ── 6. Stage 0: ham imputed (ölçekleme yok) ─────────────────────────────
+    X_tr_raw, X_te_raw, raw_names = build_raw_imputed(X_tr_df, X_te_df, feature_cols)
+    _info(f"Ham (S0) boyut: {X_tr_raw.shape}")
+
+    # ── 7. ColumnTransformer pipeline (train'de fit, test'e transform) ────────
     ct, ordered_names = build_ct_pipeline(X_tr_df, feature_cols)
     X_tr_norm = ct_transform(ct, X_tr_df, feature_cols)
     X_te_norm = ct_transform(ct, X_te_df, feature_cols)
     _info(f"Normalize boyut: {X_tr_norm.shape}")
 
-    # ── 7. 5 Aşama üret ──────────────────────────────────────────────────────
-    run_stages(X_tr_norm, y_tr, X_te_norm, y_te, le, ordered_names, "unsw", out_path,
-               n_select=n_select, strategy=strategy)
+    # ── 8. 6 Aşama üret ──────────────────────────────────────────────────────
+    run_stages(
+        X_tr_raw, X_te_raw, raw_names,
+        X_tr_norm, X_te_norm,
+        y_tr, y_te, le, ordered_names, "unsw", out_path,
+        n_select=n_select, strategy=strategy, smote_min=smote_min,
+    )
 
 
 # ─── CICIDS14 Hazırlayıcı ─────────────────────────────────────────────────────
@@ -692,9 +768,15 @@ def prepare_unsw(out_dir: Path, files_glob: str = UNSW_FILES_GLOB,
 def prepare_cicids14(out_dir: Path,
                      train_csv: Path = CICIDS14_TRAIN_CSV,
                      test_csv: Path  = CICIDS14_TEST_CSV,
-                     n_select: int = 75, strategy: str = "full"):
+                     n_select: int = 75, strategy: str = "full",
+                     smote_min: int = 8000):
     _stage("CICIDS17 (14 Sınıf) HAZIRLANIYOR")
-    folder_name = "cicids14" if strategy == "full" else f"cicids14_{strategy}"
+    if strategy == "full":
+        folder_name = "cicids14"
+    elif strategy == "pipeline_replica":
+        folder_name = "cicids14_pipeline"
+    else:
+        folder_name = f"cicids14_{strategy}"
     out_path = out_dir / folder_name
 
     # Dosya yolu çözümle (birden fazla olası konum)
@@ -871,15 +953,23 @@ def prepare_cicids14(out_dir: Path,
     y_te = le.transform(y_te_raw_mapped.astype(str))
     _info(f"CICIDS14: {len(le.classes_)} sınıf — {list(le.classes_)}")
 
-    # ── 5. ColumnTransformer pipeline ─────────────────────────────────────────
+    # ── 5. Stage 0: ham imputed ───────────────────────────────────────────────
+    X_tr_raw, X_te_raw, raw_names = build_raw_imputed(X_tr_df, X_te_df, feature_cols)
+    _info(f"Ham (S0) boyut: {X_tr_raw.shape}")
+
+    # ── 6. ColumnTransformer pipeline ─────────────────────────────────────────
     ct, ordered_names = build_ct_pipeline(X_tr_df, feature_cols)
     X_tr_norm = ct_transform(ct, X_tr_df, feature_cols)
     X_te_norm = ct_transform(ct, X_te_df, feature_cols)
     _info(f"Normalize boyut: {X_tr_norm.shape}")
 
-    # ── 6. 5 Aşama üret ───────────────────────────────────────────────────────
-    run_stages(X_tr_norm, y_tr, X_te_norm, y_te, le, ordered_names, "cicids14", out_path,
-               n_select=n_select, strategy=strategy)
+    # ── 7. 6 Aşama üret ───────────────────────────────────────────────────────
+    run_stages(
+        X_tr_raw, X_te_raw, raw_names,
+        X_tr_norm, X_te_norm,
+        y_tr, y_te, le, ordered_names, "cicids14", out_path,
+        n_select=n_select, strategy=strategy, smote_min=smote_min,
+    )
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -904,9 +994,11 @@ def main():
                     help="UNSW için test split oranı (varsayılan: 0.20)")
     ap.add_argument("--n-select",     type=int,   default=75,
                     help="Stage B SelectKBest k değeri (varsayılan: 75)")
-    ap.add_argument("--strategy",     type=str,   default="full",
-                    choices=["full", "rus_only", "rus_smote"],
-                    help="Resampling stratejisi: full | rus_only | rus_smote (varsayılan: full)")
+    ap.add_argument("--strategy",     type=str,   default="pipeline_replica",
+                    choices=["full", "rus_only", "rus_smote", "pipeline_replica"],
+                    help="Resampling: pipeline_replica (önerilen) | full | rus_only | rus_smote")
+    ap.add_argument("--smote-min",    type=int,   default=8000,
+                    help="pipeline_replica SMOTE alt sınırı (varsayılan: 8000)")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -920,6 +1012,7 @@ def main():
             test_size=args.test_size,
             n_select=args.n_select,
             strategy=args.strategy,
+            smote_min=args.smote_min,
         )
 
     if args.dataset in ("cicids14", "all"):
@@ -929,6 +1022,7 @@ def main():
             test_csv=Path(args.cicids_test),
             n_select=args.n_select,
             strategy=args.strategy,
+            smote_min=args.smote_min,
         )
 
     print(f"\n{'='*60}")

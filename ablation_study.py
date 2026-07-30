@@ -46,20 +46,40 @@ BASE_MODEL_KEYS = {
     "tabnet": "TabNet",
 }
 
-# Sutun baslikları — kümülatif ekleme sırası
+# 6 aşamalı pipeline_replica sütunları
+COL_S0    = "Ham (S0)"
+COL_S1    = "Normalize (S1)"
+COL_S2    = "+Oznitelik (S2)"
+COL_S3    = "+RUS (S3)"
+COL_S4    = "+Tomek (S4)"
+COL_S5    = "+SMOTE (S5)"
+
+# Geriye dönük uyumluluk (eski 5 aşamalı veri)
 COL_RAW       = "Raw"
 COL_ENH       = "+Oznitelik"
 COL_RUS       = "+Oznitelik+RUS"
 COL_TOMEK     = "+Oznitelik+RUS+Tomek"
 COL_SMOTE     = "+Oznitelik+RUS+Tomek+SMOTE"
-COL_CV5       = "+5Fold_CV"
-COL_STD_LOSS  = "+SMOTE+StdLoss"    # Sadece XGB ve LGBM: standart cross-entropy
-COL_FOCAL     = "+SMOTE+FocalLoss"  # Sadece XGB ve LGBM: focal loss
 
-STAGE_COLS       = [COL_RAW, COL_ENH, COL_RUS, COL_TOMEK, COL_SMOTE]
-ALL_COLS         = STAGE_COLS + [COL_CV5]
-FOCAL_LOSS_COLS  = [COL_STD_LOSS, COL_FOCAL]   # Sadece XGB/LGBM
-FOCAL_LOSS_KEYS  = {"xgb", "lgbm", "lgbmV2"}   # Bu modeller için ek sütunlar üretilir
+STAGE_COLS_LEGACY = [COL_RAW, COL_ENH, COL_RUS, COL_TOMEK, COL_SMOTE]
+STAGE_COLS_V2     = [COL_S0, COL_S1, COL_S2, COL_S3, COL_S4, COL_S5]
+
+COL_CV5       = "+5Fold_CV"
+COL_STD_LOSS  = "+SMOTE+StdLoss"
+COL_FOCAL     = "+SMOTE+FocalLoss"
+
+FOCAL_LOSS_COLS  = [COL_STD_LOSS, COL_FOCAL]
+FOCAL_LOSS_KEYS  = {"xgb", "lgbm", "lgbmV2"}
+
+# Tez raporları için azınlık sınıfları
+MINORITY_CLASSES = {"worms", "shellcode", "backdoor", "analysis"}
+
+# Tüm ablation stage'lerinde sabit model kapasitesi (n_samples'a göre değişmez)
+N_EST_XGB  = 300
+N_EST_LGBM = 300
+N_EST_HIST = 250
+N_EST_RF   = 300
+MAX_TRAIN_SUBSAMPLE = 500_000
 
 # ── yardimci ─────────────────────────────────────────────────────────────────
 
@@ -117,25 +137,37 @@ def _load_stage(stage_dir: Path):
 
 def load_ablation_stages(ds_dir: Path):
     """
-    prepare_ablation_data.py çıktısından tüm 5 aşamayı yükler.
-    ds_dir: ablation_data/cicids14  veya  ablation_data/unsw  gibi bir yol.
+    prepare_ablation_data.py çıktısından ablation aşamalarını yükler.
+    stage_0_raw varsa 6 aşamalı (v2), yoksa eski 5 aşamalı harita kullanılır.
 
     Geri dönüş:
-        stages  : dict{col_label -> (X_tr, y_tr, X_te, y_te)}
-        le      : LabelEncoder
-        classes : np.ndarray[str]
-
-    Başarısız olan aşamalar None olarak işaretlenir.
+        stages     : dict{col_label -> (X_tr, y_tr, X_te, y_te) veya None}
+        le         : LabelEncoder
+        classes    : np.ndarray[str]
+        stage_cols : aktif sütun listesi
     """
-    stage_map = {
-        COL_RAW:   "stage_A_normalized",
-        COL_ENH:   "stage_B_feature_eng",
-        COL_RUS:   "stage_C_rus",
-        COL_TOMEK: "stage_D_tomek",
-        COL_SMOTE: "stage_E_smote",
-    }
+    use_v2 = (ds_dir / "stage_0_raw" / "X_train.joblib").exists()
 
-    # LabelEncoder: herhangi bir stage'den oku
+    if use_v2:
+        stage_map = {
+            COL_S0: "stage_0_raw",
+            COL_S1: "stage_A_normalized",
+            COL_S2: "stage_B_feature_eng",
+            COL_S3: "stage_C_rus",
+            COL_S4: "stage_D_tomek",
+            COL_S5: "stage_E_smote",
+        }
+        stage_cols = STAGE_COLS_V2
+    else:
+        stage_map = {
+            COL_RAW:   "stage_A_normalized",
+            COL_ENH:   "stage_B_feature_eng",
+            COL_RUS:   "stage_C_rus",
+            COL_TOMEK: "stage_D_tomek",
+            COL_SMOTE: "stage_E_smote",
+        }
+        stage_cols = STAGE_COLS_LEGACY
+
     le = None
     for sname in stage_map.values():
         le_path = ds_dir / sname / "label_encoder.joblib"
@@ -143,7 +175,7 @@ def load_ablation_stages(ds_dir: Path):
             le = joblib.load(le_path)
             break
     if le is None:
-        return None, None, None
+        return None, None, None, stage_cols
 
     stages = {}
     for col_label, sname in stage_map.items():
@@ -154,7 +186,7 @@ def load_ablation_stages(ds_dir: Path):
         stages[col_label] = result
 
     classes = le.classes_.astype(str)
-    return stages, le, classes
+    return stages, le, classes, stage_cols
 
 
 def load_proba(path, classes):
@@ -171,7 +203,8 @@ def metrics_per_class(y_true, y_pred, classes):
     """
     Her sinif icin f1, recall, precision + genel satirlar
     dondurur: dict {sinif_adi: {F1, Recall, Precision}}
-    ve genel satirlar: Accuracy, Macro F1, Macro Recall, Macro Precision
+    ve genel satirlar: Accuracy, Macro F1, Macro Recall, Macro Precision,
+    Minority Macro F1
     """
     n = len(classes)
     p_arr, r_arr, f_arr, _ = precision_recall_fscore_support(
@@ -184,11 +217,18 @@ def metrics_per_class(y_true, y_pred, classes):
     for i, cls in enumerate(classes):
         per_cls[cls] = {"F1": f_arr[i], "Recall": r_arr[i], "Precision": p_arr[i]}
 
+    minority_f1s = [
+        f_arr[i] for i, cls in enumerate(classes)
+        if cls in MINORITY_CLASSES
+    ]
+    minority_mf1 = float(np.mean(minority_f1s)) if minority_f1s else mf
+
     overall = {
-        "Accuracy":        acc,
-        "Macro Recall":    mr,
-        "Macro F1":        mf,
-        "Macro Precision": mp,
+        "Accuracy":           acc,
+        "Macro Recall":       mr,
+        "Macro F1":           mf,
+        "Macro Precision":    mp,
+        "Minority Macro F1":  minority_mf1,
     }
     return per_cls, overall
 
@@ -287,25 +327,17 @@ def _predict_focal(model, X, needs_softmax):
 
 # ── hizli model egitimi (resampling ablasyonu icin) ──────────────────────────
 
-def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
+def _quick_model(model_key, X_tr, y_enc):
     """
-    Her model icin pipeline'a yakin parametreli egitim.
-    Ablasyonun amaci her stage'i AYNI gucte modelle karsilastirmaktir,
-    bu nedenle parametreler pipeline (unsw_nb15_pipeline.py) ile uyumludur.
-    OOF yerine single-fit kullanilir (hiz-kalite dengesi).
+    Her model icin sabit parametreli egitim.
+    Ablasyonun amaci her stage'i AYNI gucte modelle karsilastirmaktir;
+    n_estimators ve class_weight stage'ler arasinda degismez.
     """
-    cw = "balanced" if use_class_weight else None
-    n_samples = len(y_enc)
-
-    # Buyuk veri setlerinde (>300k) estimator sayisini otomatik azalt
-    def _n_est(full, mini=150):
-        return full if n_samples <= 300_000 else mini
-
     if model_key == "xgb":
         try:
             from xgboost import XGBClassifier
             m = XGBClassifier(
-                n_estimators=_n_est(400), max_depth=9, learning_rate=0.08,
+                n_estimators=N_EST_XGB, max_depth=9, learning_rate=0.08,
                 subsample=0.8, colsample_bytree=0.8,
                 min_child_weight=2, gamma=1,
                 n_jobs=-1, random_state=42, verbosity=0,
@@ -320,11 +352,10 @@ def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
         try:
             from lightgbm import LGBMClassifier
             m = LGBMClassifier(
-                n_estimators=_n_est(400), max_depth=6, num_leaves=63,
+                n_estimators=N_EST_LGBM, max_depth=6, num_leaves=63,
                 learning_rate=0.08, subsample=0.8, colsample_bytree=0.8,
                 min_child_samples=20,
                 n_jobs=-1, random_state=42, verbose=-1,
-                class_weight=cw,
             )
             m.fit(X_tr, y_enc)
             return m
@@ -335,11 +366,10 @@ def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
         try:
             from lightgbm import LGBMClassifier
             m = LGBMClassifier(
-                n_estimators=_n_est(400), max_depth=8, num_leaves=127,
+                n_estimators=N_EST_LGBM, max_depth=8, num_leaves=127,
                 learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
                 min_child_samples=20,
                 n_jobs=-1, random_state=42, verbose=-1,
-                class_weight=cw,
             )
             m.fit(X_tr, y_enc)
             return m
@@ -349,13 +379,14 @@ def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
     if model_key == "histgb":
         from sklearn.ensemble import HistGradientBoostingClassifier
         m = HistGradientBoostingClassifier(
-            max_iter=_n_est(300), max_depth=8, learning_rate=0.08,
+            max_iter=N_EST_HIST, max_depth=8, learning_rate=0.08,
             min_samples_leaf=20, l2_regularization=0.1,
             random_state=42,
         )
         m.fit(X_tr, y_enc)
         return m
 
+    n_samples = len(y_enc)
     if model_key == "tabnet":
         from sklearn.neural_network import MLPClassifier
         m = MLPClassifier(
@@ -381,9 +412,9 @@ def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
     if model_key == "rf":
         from sklearn.ensemble import RandomForestClassifier
         m = RandomForestClassifier(
-            n_estimators=_n_est(300), max_depth=None,
+            n_estimators=N_EST_RF, max_depth=None,
             min_samples_leaf=2, n_jobs=-1,
-            random_state=42, class_weight=cw,
+            random_state=42,
         )
         m.fit(X_tr, y_enc)
         return m
