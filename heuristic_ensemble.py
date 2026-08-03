@@ -2,22 +2,25 @@ import argparse, joblib, pickle, os
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.metrics import precision_recall_fscore_support, f1_score, classification_report, accuracy_score
+from sklearn.metrics import (
+    precision_recall_fscore_support, f1_score, classification_report,
+    accuracy_score, matthews_corrcoef,
+    roc_auc_score, average_precision_score,
+)
 
 def _info(m):  print(f"[Info]  {m}")
 def _stage(m): print(f"[Stage] {m}")
 
 def _load_aligned(path, classes):
-    """Loads probabilities and aligns them to the standard class order."""
     data = np.load(path, allow_pickle=True)
     P = data['proba']
     if 'classes' in data:
         src = data['classes'].astype(str)
         out = np.zeros((P.shape[0], len(classes)), dtype=np.float32)
-        idx = {c:i for i,c in enumerate(src)}
-        for j,c in enumerate(classes):
+        idx = {c: i for i, c in enumerate(src)}
+        for j, c in enumerate(classes):
             if c in idx and idx[c] < P.shape[1]:
-                out[:,j] = P[:, idx[c]]
+                out[:, j] = P[:, idx[c]]
         return out
     return P
 
@@ -26,6 +29,171 @@ def get_f1_arr(y_true, y_pred_encoded, n_cls):
         y_true, y_pred_encoded, labels=range(n_cls), zero_division=0)
     return f1
 
+# ── Yardimci metrik fonksiyonlari ────────────────────────────────────────────
+
+def _model_scalar_metrics(y_true, y_pred):
+    """Acc, Macro Prec/Recall/F1, MCC (scalar)."""
+    acc = accuracy_score(y_true, y_pred)
+    p, r, f, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    return dict(acc=acc, prec=p, recall=r, f1=f, mcc=mcc)
+
+
+def _print_model_comparison(model_metrics, display_models):
+    """Tum modeller: Accuracy | Precision | Recall | F1 | MCC  (Macro, Test)"""
+    W = 10
+    n = len(display_models)
+    sep = "+" + "-" * 16 + ("+" + "-" * (W + 2)) * n + "+"
+    print("\n" + "=" * (18 + (W + 3) * n))
+    print("  TUM MODELLER — ACC / PRECISION / RECALL / F1 / MCC  (Test, Macro)")
+    print(sep)
+    h = "| {:14} |".format("Metrik")
+    for m in display_models:
+        h += " {:^{w}} |".format(m[:W], w=W)
+    print(h)
+    print(sep)
+    for label, key in [("Accuracy",  "acc"),
+                       ("Precision", "prec"),
+                       ("Recall",    "recall"),
+                       ("F1",        "f1"),
+                       ("MCC",       "mcc")]:
+        row = "| {:<14} |".format(label)
+        for m in display_models:
+            v = model_metrics.get(m, {}).get(key, float("nan"))
+            row += " {:^{w}.4f} |".format(v, w=W)
+        print(row)
+    print(sep)
+
+
+def _print_ensemble_extended(yte_enc, yhat_te, P_soft_te, classes, n_cls):
+    """Ensemble: Macro + Weighted + ROC-AUC + PR-AUC + MCC"""
+    acc = accuracy_score(yte_enc, yhat_te)
+    mcc = matthews_corrcoef(yte_enc, yhat_te)
+    p_mac, r_mac, f_mac, _ = precision_recall_fscore_support(
+        yte_enc, yhat_te, average="macro", zero_division=0)
+    p_w, r_w, f_w, _ = precision_recall_fscore_support(
+        yte_enc, yhat_te, average="weighted", zero_division=0)
+
+    try:
+        from sklearn.preprocessing import label_binarize
+        y_bin = label_binarize(yte_enc, classes=list(range(n_cls)))
+        if y_bin.shape[1] > 1:
+            roc_auc = roc_auc_score(y_bin, P_soft_te, average="macro", multi_class="ovr")
+            ap_scores = [average_precision_score(y_bin[:, i], P_soft_te[:, i])
+                         for i in range(n_cls) if y_bin[:, i].sum() > 0]
+            pr_auc = float(np.mean(ap_scores)) if ap_scores else float("nan")
+        else:
+            roc_auc = pr_auc = float("nan")
+    except Exception as e:
+        _info(f"ROC/PR hesaplanamadi: {e}")
+        roc_auc = pr_auc = float("nan")
+
+    W = 12
+    sep = "+" + "-" * 26 + "+" + "-" * (W + 2) + "+" + "-" * (W + 2) + "+"
+    total_w = 26 + 2 * (W + 3) - 1
+    print("\n" + sep)
+    print("| {:^{w}} |".format("ENSEMBLE GENISLETILMIS METRIKLER", w=total_w))
+    print(sep)
+    print("| {:<24} | {:^{w}} | {:^{w}} |".format("Metrik", "Macro", "Weighted", w=W))
+    print(sep)
+    for label, vm, vw in [("Accuracy",  acc,   acc),
+                           ("Precision", p_mac, p_w),
+                           ("Recall",    r_mac, r_w),
+                           ("F1-Score",  f_mac, f_w)]:
+        print("| {:<24} | {:^{w}.4f} | {:^{w}.4f} |".format(label, vm, vw, w=W))
+    print(sep)
+    print("| {:<24} | {:^{w}.4f} | {:^{w}} |".format("ROC-AUC (OvR macro)", roc_auc, "-", w=W))
+    print("| {:<24} | {:^{w}.4f} | {:^{w}} |".format("PR-AUC  (macro avg)", pr_auc,  "-", w=W))
+    print("| {:<24} | {:^{w}.4f} | {:^{w}} |".format("MCC",                 mcc,     "-", w=W))
+    print(sep)
+
+
+def _plot_roc_pr(yte_enc, n_cls, model_probas, cache_dir):
+    """ROC ve PR egrisi — Ensemble + tum modeller tek grafik."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.preprocessing import label_binarize
+        from sklearn.metrics import roc_curve, precision_recall_curve, auc
+
+        y_bin = label_binarize(yte_enc, classes=list(range(n_cls)))
+        if y_bin.shape[1] == 1:
+            _info("ROC/PR grafigi: tek sinif, atlandi.")
+            return
+
+        COLORS = [
+            "#E63946", "#457B9D", "#2A9D8F", "#E9C46A", "#F4A261",
+            "#8338EC", "#3A86FF", "#06D6A0", "#FB5607", "#FFBE0B",
+            "#8D99AE", "#B5838D",
+        ]
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        for ax, curve_type in zip(axes, ["ROC", "PR"]):
+            for i, (mname, P) in enumerate(model_probas.items()):
+                color = COLORS[i % len(COLORS)]
+                lw    = 2.5 if mname == "Ensemble" else 1.5
+                ls    = "-"  if mname == "Ensemble" else "--"
+                alpha = 1.0  if mname == "Ensemble" else 0.75
+
+                aucs = []
+                if curve_type == "ROC":
+                    mean_x = np.linspace(0, 1, 200)
+                    y_interps = []
+                    for j in range(n_cls):
+                        if y_bin[:, j].sum() == 0:
+                            continue
+                        fpr_j, tpr_j, _ = roc_curve(y_bin[:, j], P[:, j])
+                        aucs.append(auc(fpr_j, tpr_j))
+                        y_interps.append(np.interp(mean_x, fpr_j, tpr_j))
+                    if y_interps:
+                        ax.plot(mean_x, np.mean(y_interps, axis=0),
+                                color=color, lw=lw, ls=ls, alpha=alpha,
+                                label=f"{mname} (AUC={np.mean(aucs):.3f})")
+                else:
+                    mean_x = np.linspace(0, 1, 200)
+                    y_interps = []
+                    for j in range(n_cls):
+                        if y_bin[:, j].sum() == 0:
+                            continue
+                        prec_j, rec_j, _ = precision_recall_curve(y_bin[:, j], P[:, j])
+                        aucs.append(auc(rec_j, prec_j))
+                        y_interps.append(np.interp(mean_x, rec_j[::-1], prec_j[::-1]))
+                    if y_interps:
+                        ax.plot(mean_x, np.mean(y_interps, axis=0),
+                                color=color, lw=lw, ls=ls, alpha=alpha,
+                                label=f"{mname} (AP={np.mean(aucs):.3f})")
+
+            if curve_type == "ROC":
+                ax.plot([0, 1], [0, 1], "k--", lw=1, label="Rastgele (AUC=0.500)")
+                ax.set_xlabel("Yanlış Pozitif Oranı", fontsize=12)
+                ax.set_ylabel("Doğru Positif Oranı", fontsize=12)
+                ax.set_title("ROC Egrisi (Makro Ort.)", fontsize=13, fontweight="bold")
+                ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+            else:
+                ax.set_xlabel("Duyarlılık", fontsize=12)
+                ax.set_ylabel("Kesinlik", fontsize=12)
+                ax.set_title("PR Egrisi (Makro Ort.)", fontsize=13, fontweight="bold")
+                ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+            ax.set_xlim([0, 1])
+            ax.set_ylim([0, 1.02])
+            ax.grid(True, linestyle="--", alpha=0.4)
+
+        plt.suptitle("Ensemble + Modeller — ROC & PR Egrisi",
+                     fontsize=14, fontweight="bold", y=1.01)
+        plt.tight_layout()
+        out = Path(cache_dir) / "ensemble_roc_pr_curves.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close()
+        _info(f"ROC/PR grafigi kaydedildi: {out}")
+
+    except Exception as e:
+        _info(f"Grafik olusturulamadi: {e}")
+
+
 def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     """
     Unified Hybrid Ensemble Architecture
@@ -33,242 +201,238 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     Overrides: Autonomous Surgical & Fast Binary Experts
     """
     cdir = Path(cache_dir)
-    le = joblib.load(cdir/'label_encoder.joblib')
+    le = joblib.load(cdir / 'label_encoder.joblib')
     classes = le.classes_.astype(str)
     n_cls = len(classes)
-    
+
     _stage("Loading Ground Truth and Model Predictions")
-    y_te = joblib.load(cdir/'y_te.joblib')
-    y_v  = joblib.load(cdir/'y_v.joblib')
-    
+    y_te = joblib.load(cdir / 'y_te.joblib')
+    y_v  = joblib.load(cdir / 'y_v.joblib')
     yte_enc = le.transform(np.asarray(y_te))
     yv_enc  = le.transform(np.asarray(y_v))
 
     # --- 1. Comparative Analysis ---
     _stage("Performing Comparative Analysis of Individual Models")
-    
+
     model_results = {}
-    
-    # Base Models
     main_models = {
-        'xgb': 'XGBoost',
-        'lgbm': 'LGBM_Enh',
-        'lgbmV2': 'LGBM_Ori',
+        'xgb':    'XGBoost',
+        'lgbm':   'LGBM_2',
+        'lgbmV2': 'LGBM_1',
         'histgb': 'HistGB',
-        'mlp': 'MLP',
+        'mlp':    'MLP',
         'tabnet': 'TabNet',
-        'rf': 'RF'
+        'rf':     'RF',
     }
-    
+
     for m_key, m_name in main_models.items():
         path = cdir / f'proba_{m_key}_oof_test.npz'
         if path.exists():
             P = _load_aligned(path, classes)
-            f1s = get_f1_arr(yte_enc, P.argmax(axis=1), n_cls)
-            model_results[m_name] = f1s
+            model_results[m_name] = get_f1_arr(yte_enc, P.argmax(axis=1), n_cls)
 
-    # Load Fast Experts and Surgical Experts for the Comparative Table
-    all_probas = list(cdir.glob('proba_*_oof_test.npz'))
-    for p in all_probas:
+    for p in list(cdir.glob('proba_*_oof_test.npz')):
         name = p.stem.replace('proba_', '').replace('_oof_test', '')
-        if name in main_models: continue
-        
-        if 'aecnn' in name.lower() or 'ae_cnn' in name.lower(): continue
-        
-        # Friendly names
-        f_name = name.replace('fast_expert_', 'FE_').replace('expert_', 'E_').replace('bb_', 'BB_').replace('tabnet_', 'TN_').title()
-        
+        if name in main_models:
+            continue
+        if 'aecnn' in name.lower() or 'ae_cnn' in name.lower():
+            continue
+        f_name = (name.replace('fast_expert_', 'FE_')
+                      .replace('expert_', 'E_')
+                      .replace('bb_', 'BB_')
+                      .replace('tabnet_', 'TN_').title())
         P = _load_aligned(p, classes)
         f1s = get_f1_arr(yte_enc, P.argmax(axis=1), n_cls)
-        
-        if np.max(f1s) > 0.01: 
-             model_results[f_name] = f1s
+        if np.max(f1s) > 0.01:
+            model_results[f_name] = f1s
 
-    # Print Comparative Table
-    sorted_models = sorted(model_results.keys(), key=lambda x: np.mean(model_results[x]), reverse=True)
-    display_models = sorted_models[:15] # Display up to 15 models to include experts
+    sorted_models  = sorted(model_results.keys(),
+                            key=lambda x: np.mean(model_results[x]), reverse=True)
+    display_models = sorted_models[:15]
 
+    # Sinif bazli F1 tablosu (orijinal)
     print("\n" + "=" * 110)
     print(f"| {'DETAILED COMPARATIVE PERFORMANCE ANALYSIS (Test Set F1-Scores)':^106} |")
     print("+" + "-" * 15 + "+" + ("-" * 10 + "+") * len(display_models))
-    
     header = f"| {'Class':<13} |"
     for m in display_models:
         header += f" {m[:8]:^8} |"
     print(header)
     print("+" + "-" * 15 + "+" + ("-" * 10 + "+") * len(display_models))
-
     for i, cls in enumerate(classes):
         row = f"| {cls:<13} |"
         for m in display_models:
             row += f" {model_results[m][i]:^8.4f} |"
         print(row)
-
     print("+" + "-" * 15 + "+" + ("-" * 10 + "+") * len(display_models))
-    
     macro_row = f"| {'Macro F1':<13} |"
     for m in display_models:
         macro_row += f" {np.mean(model_results[m]):^8.4f} |"
     print(macro_row)
     print("+" + "-" * 15 + "+" + ("-" * 10 + "+") * len(display_models))
 
+    # Acc / Precision / Recall / F1 / MCC tablosu
+    model_metrics_dict = {}
+    # ROC/PR grafigi icin: sadece ana modeller (surgical/fast expert haric)
+    main_model_names = set(main_models.values())
+    model_probas_dict  = {}
+
+    for m_name in display_models:
+        ppath_key = None
+        for mk, mn in main_models.items():
+            if mn == m_name:
+                ppath_key = mk
+                break
+        if ppath_key:
+            p = cdir / f'proba_{ppath_key}_oof_test.npz'
+        else:
+            slug = (m_name.lower()
+                    .replace('fe_', 'fast_expert_')
+                    .replace('e_', 'expert_'))
+            p = cdir / f'proba_{slug}_oof_test.npz'
+            if not p.exists():
+                candidates = list(cdir.glob(
+                    f'proba_*{slug.split("_")[0]}*_oof_test.npz'))
+                p = candidates[0] if candidates else None
+        if p and Path(p).exists():
+            P = _load_aligned(str(p), classes)
+            model_metrics_dict[m_name] = _model_scalar_metrics(yte_enc, P.argmax(axis=1))
+            # Grafige sadece ana modelleri ekle
+            if m_name in main_model_names:
+                model_probas_dict[m_name] = P
+
+    _print_model_comparison(model_metrics_dict, display_models)
+
     # --- 2. Base Consensus: Class-Wise Validation-Weighted Soft Voting ---
     _stage("Establishing Base Consensus: Class-Wise Validation-Weighted Soft Voting")
-    
-    # Get validation F1 scores for weighting
+
     val_model_results = {}
     for m_key in main_models:
         path = cdir / f'proba_{m_key}_oof_valid.npz'
         if path.exists():
             P_v = _load_aligned(path, classes)
-            f1s = get_f1_arr(yv_enc, P_v.argmax(axis=1), n_cls)
-            val_model_results[m_key] = f1s
+            val_model_results[m_key] = get_f1_arr(yv_enc, P_v.argmax(axis=1), n_cls)
 
-    # Compute validation soft voting predictions to establish the baseline for experts
     P_soft_val = np.zeros((len(yv_enc), n_cls), dtype=np.float32)
     weight_sum = np.zeros(n_cls)
     for m_key in main_models:
         if m_key in val_model_results:
-            weight_arr = val_model_results[m_key]
+            w = val_model_results[m_key]
             p_path = cdir / f'proba_{m_key}_oof_valid.npz'
             if p_path.exists():
-                P_m = _load_aligned(p_path, classes)
-                P_soft_val += P_m * weight_arr
-                weight_sum += weight_arr
-                
+                P_soft_val += _load_aligned(p_path, classes) * w
+                weight_sum += w
     weight_sum[weight_sum == 0] = 1e-9
     P_soft_val /= weight_sum
-    
-    base_val_preds = P_soft_val.argmax(axis=1)
-    base_val_f1 = get_f1_arr(yv_enc, base_val_preds, n_cls)
-    
-    _info(f"Consensus Base Model (Soft Voting) achieved Validation Macro F1: {np.mean(base_val_f1):.4f}")
 
-    # Compute test soft voting predictions
-    # Load one dummy test proba to safely get the target array shape
-    dummy_path = cdir / f'proba_xgb_oof_test.npz'
+    base_val_preds = P_soft_val.argmax(axis=1)
+    _info(f"Consensus Base Model Validation Macro F1: "
+          f"{np.mean(get_f1_arr(yv_enc, base_val_preds, n_cls)):.4f}")
+
+    # Test soft voting
+    dummy_path = cdir / 'proba_xgb_oof_test.npz'
     if not dummy_path.exists():
-        # Fallback if xgb doesn't exist
         for m in main_models:
-            candidate = cdir / f'proba_{m}_oof_test.npz'
-            if candidate.exists():
-                dummy_path = candidate
+            c = cdir / f'proba_{m}_oof_test.npz'
+            if c.exists():
+                dummy_path = c
                 break
         else:
             existing = [f.name for f in cdir.iterdir()] if cdir.exists() else []
             raise RuntimeError(
-                f"No model probability files (proba_*_oof_test.npz) found in '{cdir}'.\n"
-                f"Run the individual model training scripts first to generate OOF predictions.\n"
-                f"Files currently in '{cdir}':\n  " + "\n  ".join(existing or ["(directory is empty or missing)"])
-            )
+                f"No proba_*_oof_test.npz found in '{cdir}'.\n"
+                "Files: " + "\n  ".join(existing or ["(empty)"]))
 
-    dummy_P = _load_aligned(dummy_path, classes)
-    
-    P_soft_te = np.zeros_like(dummy_P)
+    P_soft_te = np.zeros_like(_load_aligned(dummy_path, classes))
     weight_sum_te = np.zeros(n_cls)
     for m_key in main_models:
         if m_key in val_model_results:
-            weight_arr = val_model_results[m_key]
+            w = val_model_results[m_key]
             p_path = cdir / f'proba_{m_key}_oof_test.npz'
             if p_path.exists():
-                P_m = _load_aligned(p_path, classes)
-                P_soft_te += P_m * weight_arr
-                weight_sum_te += weight_arr
-                
+                P_soft_te += _load_aligned(p_path, classes) * w
+                weight_sum_te += w
     weight_sum_te[weight_sum_te == 0] = 1e-9
     P_soft_te /= weight_sum_te
     yhat_te = P_soft_te.argmax(axis=1)
 
-    # --- 3. Autonomous Surgical & Fast Expert Overrides ---
+    # --- 3. Surgical & Fast Expert Overrides ---
     _stage("Applying Autonomous Surgical Overrides (Validation-Gated)")
-    
-    # Phase A: Surgical Binary Expert Override
+
     for expert_proba_path in sorted(cdir.glob('proba_surgical_*_oof_test.npz')):
-        cls_name = expert_proba_path.stem.replace('proba_surgical_', '').replace('_oof_test', '').replace('_expert', '')
+        cls_name = (expert_proba_path.stem
+                    .replace('proba_surgical_', '')
+                    .replace('_oof_test', '')
+                    .replace('_expert', ''))
         if cls_name not in classes:
             continue
-            
-        thresh_path = cdir / f'surgical_{cls_name}_threshold.pkl'
-        proba_path = expert_proba_path
+        thresh_path    = cdir / f'surgical_{cls_name}_threshold.pkl'
         proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
-        
         c_idx = int(np.where(classes == cls_name)[0][0])
         apply_override = True
-        
-        # Verify on validation set against Soft Voting consensus with Precision Safeguard
+
         if proba_val_path.exists():
             P_surg_val = _load_aligned(proba_val_path, classes)
             with open(thresh_path, 'rb') as f:
                 opt_thresh = pickle.load(f)
-                
             temp_val = base_val_preds.copy()
-            surg_val_mask = P_surg_val[:, c_idx] >= opt_thresh
-            temp_val[surg_val_mask] = c_idx
-            
-            prec_base, _, f1_base_arr, _ = precision_recall_fscore_support(yv_enc, base_val_preds, average=None, zero_division=0)
-            prec_new, _, f1_new_arr, _ = precision_recall_fscore_support(yv_enc, temp_val, average=None, zero_division=0)
-            
-            target_improved = f1_new_arr[c_idx] > f1_base_arr[c_idx]
-            precision_safeguard = np.all(prec_new >= 0.97 * prec_base)
-            
-            if not (target_improved and precision_safeguard):
-                _info(f"  -> {cls_name}: Surgical expert BYPASSED (Failed Precision Safeguard or F1 Improvement)")
+            temp_val[P_surg_val[:, c_idx] >= opt_thresh] = c_idx
+            prec_base, _, f1_base, _ = precision_recall_fscore_support(
+                yv_enc, base_val_preds, average=None, zero_division=0)
+            prec_new, _, f1_new, _ = precision_recall_fscore_support(
+                yv_enc, temp_val, average=None, zero_division=0)
+            if not (f1_new[c_idx] > f1_base[c_idx] and
+                    np.all(prec_new >= 0.97 * prec_base)):
+                _info(f"  -> {cls_name}: Surgical BYPASSED")
                 apply_override = False
-        
+
         if apply_override:
             with open(thresh_path, 'rb') as f:
                 opt_thresh = pickle.load(f)
-            P_surgical = _load_aligned(proba_path, classes)
-            surgical_mask = P_surgical[:, c_idx] >= opt_thresh
-            count = int(np.sum(surgical_mask))
-            if count > 0:
-                yhat_te[surgical_mask] = c_idx
-                _info(f"  -> SURGICAL: {cls_name} expert overrode {count} predictions (thresh >= {opt_thresh:.3f})")
+            P_surg = _load_aligned(expert_proba_path, classes)
+            mask = P_surg[:, c_idx] >= opt_thresh
+            if mask.sum() > 0:
+                yhat_te[mask] = c_idx
+                _info(f"  -> SURGICAL: {cls_name} overrode {int(mask.sum())} "
+                      f"(thresh={opt_thresh:.3f})")
 
-    # Phase A.2: Fast Binary Expert Override
     for expert_val_path in sorted(cdir.glob('proba_fast_expert_*_oof_valid.npz')):
-        cls_name = expert_val_path.stem.replace('proba_fast_expert_', '').replace('_oof_valid', '')
-        if cls_name not in classes: continue
-        
+        cls_name = (expert_val_path.stem
+                    .replace('proba_fast_expert_', '')
+                    .replace('_oof_valid', ''))
+        if cls_name not in classes:
+            continue
         expert_test_path = cdir / f'proba_fast_expert_{cls_name}_oof_test.npz'
-        if not expert_test_path.exists(): continue
-        
+        if not expert_test_path.exists():
+            continue
         c_idx = int(np.where(classes == cls_name)[0][0])
-        
-        # Optimize edilmiş eşiği yükle, yoksa 0.5 kullan
         thresh_path = cdir / f'fast_threshold_{cls_name}.pkl'
-        if thresh_path.exists():
-            with open(thresh_path, 'rb') as f:
-                opt_thresh = pickle.load(f)
-            _info(f"  -> {cls_name}: Using optimized threshold {opt_thresh:.3f}")
-        else:
-            opt_thresh = 0.5
-            _info(f"  -> {cls_name}: No threshold file found, using default 0.5")
-        
+        opt_thresh = pickle.load(open(thresh_path, 'rb')) if thresh_path.exists() else 0.5
+        _info(f"  -> {cls_name}: thresh={opt_thresh:.3f}")
+
         P_fe_val = _load_aligned(expert_val_path, classes)
         temp_val = base_val_preds.copy()
-        fe_val_mask = P_fe_val[:, c_idx] >= opt_thresh
-        temp_val[fe_val_mask] = c_idx
-        
-        prec_base, _, f1_base_arr, _ = precision_recall_fscore_support(yv_enc, base_val_preds, average=None, zero_division=0)
-        prec_new, _, f1_new_arr, _ = precision_recall_fscore_support(yv_enc, temp_val, average=None, zero_division=0)
-        
-        target_improved = f1_new_arr[c_idx] > f1_base_arr[c_idx]
-        precision_safeguard = np.all(prec_new >= 0.97 * prec_base)
-        
-        if not (target_improved and precision_safeguard):
-            _info(f"  -> {cls_name}: Fast expert BYPASSED (Failed Precision Safeguard or F1 Improvement)")
-        else:
-            P_fe_te = _load_aligned(expert_test_path, classes)
-            fe_test_mask = P_fe_te[:, c_idx] >= opt_thresh
-            count = int(np.sum(fe_test_mask))
-            if count > 0:
-                yhat_te[fe_test_mask] = c_idx
-                _info(f"  -> FAST EXPERT: {cls_name} expert overrode {count} predictions (thresh >= {opt_thresh:.3f})")
+        temp_val[P_fe_val[:, c_idx] >= opt_thresh] = c_idx
+        prec_base, _, f1_base, _ = precision_recall_fscore_support(
+            yv_enc, base_val_preds, average=None, zero_division=0)
+        prec_new, _, f1_new, _ = precision_recall_fscore_support(
+            yv_enc, temp_val, average=None, zero_division=0)
 
-    # --- FINAL: Evaluate and Print Results ---
-    f1s_ens = get_f1_arr(yte_enc, yhat_te, n_cls)
+        if not (f1_new[c_idx] > f1_base[c_idx] and
+                np.all(prec_new >= 0.97 * prec_base)):
+            _info(f"  -> {cls_name}: Fast expert BYPASSED")
+            continue
+
+        P_fe_te = _load_aligned(expert_test_path, classes)
+        mask = P_fe_te[:, c_idx] >= opt_thresh
+        if mask.sum() > 0:
+            yhat_te[mask] = c_idx
+            _info(f"  -> FAST EXPERT: {cls_name} overrode {int(mask.sum())}")
+
+    # --- FINAL ---
+    f1s_ens  = get_f1_arr(yte_enc, yhat_te, n_cls)
     macro_ens = np.mean(f1s_ens)
+    acc_ens   = accuracy_score(yte_enc, yhat_te)
 
     _stage("Hybrid Ensemble Final Performance")
     print("\n" + "=" * 50)
@@ -276,35 +440,38 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
     print(f"| {'Class':<18} | {'F1-Score':^10} | {'Status':^10} |")
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
-    
     median_f1 = float(np.median(f1s_ens[f1s_ens > 0])) if np.any(f1s_ens > 0) else 0.5
-
     for i, cls in enumerate(classes):
-        val = f1s_ens[i]
-        status = "OK" if val >= median_f1 else "LOW" if val > 0 else "-"
-        print(f"| {cls:<18} | {val:^10.4f} | {status:^10} |")
-        
-    acc_ens = accuracy_score(yte_enc, yhat_te)
+        v = f1s_ens[i]
+        status = "OK" if v >= median_f1 else "LOW" if v > 0 else "-"
+        print(f"| {cls:<18} | {v:^10.4f} | {status:^10} |")
     print("+" + "-" * 20 + "+" + "-" * 12 + "+" + "-" * 12 + "+")
-    print(f"| {'MACRO F1':<18} | {macro_ens:^10.4f} | {'SUCCESS' if macro_ens >= 0.75 else 'IN-PROG':^10} |")
+    print(f"| {'MACRO F1':<18} | {macro_ens:^10.4f} | "
+          f"{'SUCCESS' if macro_ens >= 0.75 else 'IN-PROG':^10} |")
     print(f"| {'ACCURACY':<18} | {acc_ens:^10.4f} | {'-':^10} |")
     print("=" * 50)
-    _info(f"Hybrid Ensemble achieved Macro F1: {macro_ens:.4f}")
+    _info(f"Hybrid Ensemble Macro F1: {macro_ens:.4f}")
     _info(f"Overall Accuracy: {acc_ens:.4f}")
+
+    # Genisletilmis metrikler: Macro/Weighted + ROC-AUC + PR-AUC + MCC
+    _print_ensemble_extended(yte_enc, yhat_te, P_soft_te, classes, n_cls)
+
+    # ROC ve PR egrisi grafigi
+    model_probas_dict["Ensemble"] = P_soft_te
+    _plot_roc_pr(yte_enc, n_cls, model_probas_dict, str(cdir))
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('--unsw', action='store_true', default=True, help='UNSW-NB15 modu (default)')
-    mode_group.add_argument('--cicids', action='store_true', help='CICIDS17 modu')
-    mode_group.add_argument('--cicids14', action='store_true', help='CICIDS17 14 sinifli modu')
-    
+    mode_group.add_argument('--unsw',    action='store_true', default=True)
+    mode_group.add_argument('--cicids',  action='store_true')
+    mode_group.add_argument('--cicids14',action='store_true')
     parser.add_argument('--cache-dir', type=str, default='.')
     parser.add_argument('--exclude-weak-classes', action='store_true')
     args = parser.parse_args()
-    
-    dataset_mode = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
+
+    dataset_mode    = 'cicids14' if args.cicids14 else ('cicids' if args.cicids else 'unsw')
     cache_mode_name = dataset_mode + "_excluded" if args.exclude_weak_classes else dataset_mode
-    target_cache_dir = Path(args.cache_dir) / cache_mode_name
-    
-    heuristic_ensemble(str(target_cache_dir), args.exclude_weak_classes)
+    heuristic_ensemble(str(Path(args.cache_dir) / cache_mode_name),
+                       args.exclude_weak_classes)
