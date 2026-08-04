@@ -46,40 +46,19 @@ BASE_MODEL_KEYS = {
     "tabnet": "TabNet",
 }
 
-# 6 aşamalı pipeline_replica sütunları
-COL_S0    = "Ham (S0)"
-COL_S1    = "Normalize (S1)"
-COL_S2    = "+Oznitelik (S2)"
-COL_S3    = "+RUS (S3)"
-COL_S4    = "+Tomek (S4)"
-COL_S5    = "+SMOTE (S5)"
-
-# Geriye dönük uyumluluk (eski 5 aşamalı veri)
+# Sutun baslikları — kümülatif ekleme sırası
 COL_RAW       = "Raw"
 COL_ENH       = "+Oznitelik"
 COL_RUS       = "+Oznitelik+RUS"
 COL_TOMEK     = "+Oznitelik+RUS+Tomek"
 COL_SMOTE     = "+Oznitelik+RUS+Tomek+SMOTE"
-
-STAGE_COLS_LEGACY = [COL_RAW, COL_ENH, COL_RUS, COL_TOMEK, COL_SMOTE]
-STAGE_COLS_V2     = [COL_S0, COL_S1, COL_S2, COL_S3, COL_S4, COL_S5]
-
+COL_COST_ADJ  = "+Focal_ClassWeight"
 COL_CV5       = "+5Fold_CV"
-COL_STD_LOSS  = "+SMOTE+StdLoss"
-COL_FOCAL     = "+SMOTE+FocalLoss"
 
-FOCAL_LOSS_COLS  = [COL_STD_LOSS, COL_FOCAL]
-FOCAL_LOSS_KEYS  = {"xgb", "lgbm", "lgbmV2"}
-
-# Tez raporları için azınlık sınıfları
-MINORITY_CLASSES = {"worms", "shellcode", "backdoor", "analysis"}
-
-# Tüm ablation stage'lerinde sabit model kapasitesi (n_samples'a göre değişmez)
-N_EST_XGB  = 300
-N_EST_LGBM = 300
-N_EST_HIST = 250
-N_EST_RF   = 300
-MAX_TRAIN_SUBSAMPLE = 500_000
+STAGE_COLS       = [COL_RAW, COL_ENH, COL_RUS, COL_TOMEK, COL_SMOTE]
+ALL_COLS         = STAGE_COLS + [COL_COST_ADJ, COL_CV5]
+FOCAL_LOSS_KEYS  = {"xgb", "lgbm", "lgbmV2"}   # Focal Loss uygulanacak modeller
+CLASS_WEIGHT_KEYS= {"histgb", "tabnet", "mlp", "rf"} # Class Weight uygulanacak modeller
 
 # ── yardimci ─────────────────────────────────────────────────────────────────
 
@@ -137,37 +116,25 @@ def _load_stage(stage_dir: Path):
 
 def load_ablation_stages(ds_dir: Path):
     """
-    prepare_ablation_data.py çıktısından ablation aşamalarını yükler.
-    stage_0_raw varsa 6 aşamalı (v2), yoksa eski 5 aşamalı harita kullanılır.
+    prepare_ablation_data.py çıktısından tüm 5 aşamayı yükler.
+    ds_dir: ablation_data/cicids14  veya  ablation_data/unsw  gibi bir yol.
 
     Geri dönüş:
-        stages     : dict{col_label -> (X_tr, y_tr, X_te, y_te) veya None}
-        le         : LabelEncoder
-        classes    : np.ndarray[str]
-        stage_cols : aktif sütun listesi
+        stages  : dict{col_label -> (X_tr, y_tr, X_te, y_te)}
+        le      : LabelEncoder
+        classes : np.ndarray[str]
+
+    Başarısız olan aşamalar None olarak işaretlenir.
     """
-    use_v2 = (ds_dir / "stage_0_raw" / "X_train.joblib").exists()
+    stage_map = {
+        COL_RAW:   "stage_A_normalized",
+        COL_ENH:   "stage_B_feature_eng",
+        COL_RUS:   "stage_C_rus",
+        COL_TOMEK: "stage_D_tomek",
+        COL_SMOTE: "stage_E_smote",
+    }
 
-    if use_v2:
-        stage_map = {
-            COL_S0: "stage_0_raw",
-            COL_S1: "stage_A_normalized",
-            COL_S2: "stage_B_feature_eng",
-            COL_S3: "stage_C_rus",
-            COL_S4: "stage_D_tomek",
-            COL_S5: "stage_E_smote",
-        }
-        stage_cols = STAGE_COLS_V2
-    else:
-        stage_map = {
-            COL_RAW:   "stage_A_normalized",
-            COL_ENH:   "stage_B_feature_eng",
-            COL_RUS:   "stage_C_rus",
-            COL_TOMEK: "stage_D_tomek",
-            COL_SMOTE: "stage_E_smote",
-        }
-        stage_cols = STAGE_COLS_LEGACY
-
+    # LabelEncoder: herhangi bir stage'den oku
     le = None
     for sname in stage_map.values():
         le_path = ds_dir / sname / "label_encoder.joblib"
@@ -175,7 +142,7 @@ def load_ablation_stages(ds_dir: Path):
             le = joblib.load(le_path)
             break
     if le is None:
-        return None, None, None, stage_cols
+        return None, None, None
 
     stages = {}
     for col_label, sname in stage_map.items():
@@ -186,7 +153,7 @@ def load_ablation_stages(ds_dir: Path):
         stages[col_label] = result
 
     classes = le.classes_.astype(str)
-    return stages, le, classes, stage_cols
+    return stages, le, classes
 
 
 def load_proba(path, classes):
@@ -203,8 +170,7 @@ def metrics_per_class(y_true, y_pred, classes):
     """
     Her sinif icin f1, recall, precision + genel satirlar
     dondurur: dict {sinif_adi: {F1, Recall, Precision}}
-    ve genel satirlar: Accuracy, Macro F1, Macro Recall, Macro Precision,
-    Minority Macro F1
+    ve genel satirlar: Accuracy, Macro F1, Macro Recall, Macro Precision
     """
     n = len(classes)
     p_arr, r_arr, f_arr, _ = precision_recall_fscore_support(
@@ -217,18 +183,11 @@ def metrics_per_class(y_true, y_pred, classes):
     for i, cls in enumerate(classes):
         per_cls[cls] = {"F1": f_arr[i], "Recall": r_arr[i], "Precision": p_arr[i]}
 
-    minority_f1s = [
-        f_arr[i] for i, cls in enumerate(classes)
-        if cls in MINORITY_CLASSES
-    ]
-    minority_mf1 = float(np.mean(minority_f1s)) if minority_f1s else mf
-
     overall = {
-        "Accuracy":           acc,
-        "Macro Recall":       mr,
-        "Macro F1":           mf,
-        "Macro Precision":    mp,
-        "Minority Macro F1":  minority_mf1,
+        "Accuracy":        acc,
+        "Macro Recall":    mr,
+        "Macro F1":        mf,
+        "Macro Precision": mp,
     }
     return per_cls, overall
 
@@ -327,17 +286,25 @@ def _predict_focal(model, X, needs_softmax):
 
 # ── hizli model egitimi (resampling ablasyonu icin) ──────────────────────────
 
-def _quick_model(model_key, X_tr, y_enc):
+def _quick_model(model_key, X_tr, y_enc, use_class_weight=False):
     """
-    Her model icin sabit parametreli egitim.
-    Ablasyonun amaci her stage'i AYNI gucte modelle karsilastirmaktir;
-    n_estimators ve class_weight stage'ler arasinda degismez.
+    Her model icin pipeline'a yakin parametreli egitim.
+    Ablasyonun amaci her stage'i AYNI gucte modelle karsilastirmaktir,
+    bu nedenle parametreler pipeline (unsw_nb15_pipeline.py) ile uyumludur.
+    OOF yerine single-fit kullanilir (hiz-kalite dengesi).
     """
+    cw = "balanced" if use_class_weight else None
+    n_samples = len(y_enc)
+
+    # Buyuk veri setlerinde (>300k) estimator sayisini otomatik azalt
+    def _n_est(full, mini=150):
+        return full if n_samples <= 300_000 else mini
+
     if model_key == "xgb":
         try:
             from xgboost import XGBClassifier
             m = XGBClassifier(
-                n_estimators=N_EST_XGB, max_depth=9, learning_rate=0.08,
+                n_estimators=_n_est(400), max_depth=9, learning_rate=0.08,
                 subsample=0.8, colsample_bytree=0.8,
                 min_child_weight=2, gamma=1,
                 n_jobs=-1, random_state=42, verbosity=0,
@@ -352,24 +319,27 @@ def _quick_model(model_key, X_tr, y_enc):
         try:
             from lightgbm import LGBMClassifier
             m = LGBMClassifier(
-                n_estimators=N_EST_LGBM, max_depth=6, num_leaves=63,
+                n_estimators=_n_est(400), max_depth=6, num_leaves=63,
                 learning_rate=0.08, subsample=0.8, colsample_bytree=0.8,
                 min_child_samples=20,
                 n_jobs=-1, random_state=42, verbose=-1,
+                class_weight=cw,
             )
             m.fit(X_tr, y_enc)
             return m
         except Exception as e:
             _info(f"LGBM hatasi: {e}")
+            
 
     if model_key == "lgbmV2":
         try:
             from lightgbm import LGBMClassifier
             m = LGBMClassifier(
-                n_estimators=N_EST_LGBM, max_depth=8, num_leaves=127,
+                n_estimators=_n_est(400), max_depth=8, num_leaves=127,
                 learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
                 min_child_samples=20,
                 n_jobs=-1, random_state=42, verbose=-1,
+                class_weight=cw,
             )
             m.fit(X_tr, y_enc)
             return m
@@ -379,14 +349,14 @@ def _quick_model(model_key, X_tr, y_enc):
     if model_key == "histgb":
         from sklearn.ensemble import HistGradientBoostingClassifier
         m = HistGradientBoostingClassifier(
-            max_iter=N_EST_HIST, max_depth=8, learning_rate=0.08,
+            max_iter=_n_est(300), max_depth=8, learning_rate=0.08,
             min_samples_leaf=20, l2_regularization=0.1,
             random_state=42,
+            class_weight=cw,
         )
         m.fit(X_tr, y_enc)
         return m
 
-    n_samples = len(y_enc)
     if model_key == "tabnet":
         from sklearn.neural_network import MLPClassifier
         m = MLPClassifier(
@@ -412,9 +382,9 @@ def _quick_model(model_key, X_tr, y_enc):
     if model_key == "rf":
         from sklearn.ensemble import RandomForestClassifier
         m = RandomForestClassifier(
-            n_estimators=N_EST_RF, max_depth=None,
+            n_estimators=_n_est(300), max_depth=None,
             min_samples_leaf=2, n_jobs=-1,
-            random_state=42,
+            random_state=42, class_weight=cw,
         )
         m.fit(X_tr, y_enc)
         return m
@@ -433,10 +403,10 @@ def _predict(model, X):
     return model.predict(X)
 
 
-def _quick_model_cv5(model_key, X_train, y_train, X_test, n_folds=5):
+def _quick_model_cv5(model_key, X_train, y_train, X_test, n_folds=5, use_focal=False, use_class_weight=False):
     """
     5-Fold Stratified CV ile model egitip test seti uzerinde
-    olasilik ortalamasi ile tahmin uret. Default parametreler kullanilir.
+    olasilik ortalamasi ile tahmin uret.
     """
     from sklearn.model_selection import StratifiedKFold
 
@@ -468,12 +438,20 @@ def _quick_model_cv5(model_key, X_train, y_train, X_test, n_folds=5):
             X_fold_tr = X_fold_tr[sub_idx]
             y_fold_tr = y_fold_tr[sub_idx]
 
-        m = _quick_model(model_key, X_fold_tr, y_fold_tr, use_class_weight=False)
+        if use_focal and model_key in FOCAL_LOSS_KEYS:
+            m, needs_sm = _quick_model_with_focal(model_key, X_fold_tr, y_fold_tr, n_classes)
+        else:
+            m = _quick_model(model_key, X_fold_tr, y_fold_tr, use_class_weight=use_class_weight)
+            needs_sm = False
+
         if m is None:
             continue
 
         if hasattr(m, 'predict_proba'):
             fold_proba = m.predict_proba(X_test)
+            if use_focal and model_key in FOCAL_LOSS_KEYS and needs_sm:
+                from scipy.special import softmax
+                fold_proba = softmax(fold_proba, axis=1)
             if fold_proba.shape[1] == n_classes:
                 proba_sum += fold_proba
             else:
@@ -535,25 +513,12 @@ def build_resampling_configs(Xt_tr, y_tr_enc):
         X_rus, y_rus = X_prev, y_prev
         configs.append((COL_RUS, X_rus, y_rus))
 
-    # +Tomek — sinir orneklerini temizle
-    # Guvenlik: cok kucuk siniflar (< 20 ornek) olan veri setlerinde
-    # Tomek sinir analizi yanlis ciftler olusturabilir — bu durumda atla.
-    try:
-        from imblearn.under_sampling import TomekLinks
-        vc_check = pd.Series(X_prev if False else y_prev).value_counts()
-        min_cls_count = int(vc_check.min())
-        if min_cls_count < 20:
-            _info(f"TomekLinks: min sinif cok kucuk ({min_cls_count}<20), Tomek atlaniyor — RUS verisi kopyalanıyor")
-            configs.append((COL_TOMEK, X_prev, y_prev))
-        else:
-            tl = TomekLinks(sampling_strategy="not minority", n_jobs=-1)
-            X_tl, y_tl = tl.fit_resample(X_prev, y_prev)
-            configs.append((COL_TOMEK, X_tl, y_tl))
-            X_prev, y_prev = X_tl, y_tl
-    except Exception as e:
-        _info(f"TomekLinks hatasi: {e}")
-        X_tl, y_tl = X_prev, y_prev
-        configs.append((COL_TOMEK, X_tl, y_tl))
+    # +Tomek — KALDIRILDI
+    # Ablasyon analizi Tomek'in nadir sinif orneklerini silerek sistematik
+    # zarar verdigini gostermistir. Stage D = Stage C kopyasi.
+    X_tl, y_tl = X_prev, y_prev
+    configs.append((COL_TOMEK, X_tl, y_tl))
+    _info("Tomek atlandi (kalici olarak kaldirildi) — RUS verisi kopyalandi")
 
     # +SMOTE — sadece kucuk siniflari makul seviyeye cek
     try:
@@ -610,7 +575,7 @@ def build_model_table_from_stages(model_key, model_name, stages, classes, cdir=N
         return None
 
     n_cls = len(classes)
-    model_cols = ALL_COLS + (FOCAL_LOSS_COLS if model_key in FOCAL_LOSS_KEYS else [])
+    model_cols = ALL_COLS
 
     row_index = []
     for cls in classes:
@@ -701,51 +666,59 @@ def build_model_table_from_stages(model_key, model_name, stages, classes, cdir=N
             df[col] = df[prev_col]
             _info(f"  {model_name} {col}: başarısız, '{prev_col}' kopyalandı")
 
-    # ── 5-Fold CV sütunu ──────────────────────────────────────────────────
+    # ── 6. Focal / Class Weight Sütunu ────────────────────────────────────
     smote_data = stages.get(COL_SMOTE)
+    if smote_data is not None:
+        X_sm, y_sm, X_te_cost, _ = smote_data
+        n_cls_count = len(classes)
+        t0 = time.time()
+        
+        if model_key in FOCAL_LOSS_KEYS:
+            m_cost, needs_sm = _quick_model_with_focal(model_key, X_sm, y_sm, n_cls_count)
+            if m_cost is not None:
+                yhat_cost = _predict_focal(m_cost, X_te_cost, needs_sm)
+                _fill_col(COL_COST_ADJ, yhat_cost)
+                _, _, mf1, _ = precision_recall_fscore_support(
+                    y_te_enc, yhat_cost, average="macro", zero_division=0)
+                _info(f"  {model_name} {COL_COST_ADJ:30s} → Focal Loss, MacroF1={mf1:.4f} ({time.time()-t0:.1f}s)")
+            else:
+                df[COL_COST_ADJ] = df[COL_SMOTE]
+                _info(f"  {model_name} {COL_COST_ADJ}: Focal Loss basarisiz, kopyalandi")
+        else:
+            m_cost = _quick_model(model_key, X_sm, y_sm, use_class_weight=True)
+            if m_cost is not None:
+                yhat_cost = _predict(m_cost, X_te_cost)
+                _fill_col(COL_COST_ADJ, yhat_cost)
+                _, _, mf1, _ = precision_recall_fscore_support(
+                    y_te_enc, yhat_cost, average="macro", zero_division=0)
+                _info(f"  {model_name} {COL_COST_ADJ:30s} → Class Weight, MacroF1={mf1:.4f} ({time.time()-t0:.1f}s)")
+            else:
+                df[COL_COST_ADJ] = df[COL_SMOTE]
+                _info(f"  {model_name} {COL_COST_ADJ}: Class Weight basarisiz, kopyalandi")
+    elif prev_col is not None:
+        df[COL_COST_ADJ] = df[prev_col]
+
+    # ── 7. 5-Fold CV sütunu ───────────────────────────────────────────────
     if smote_data is not None:
         X_tr_cv, y_tr_cv, X_te_cv, _ = smote_data
         t0 = time.time()
-        y_pred_cv = _quick_model_cv5(model_key, X_tr_cv, y_tr_cv, X_te_cv)
+        
+        use_focal = model_key in FOCAL_LOSS_KEYS
+        use_cw = model_key not in FOCAL_LOSS_KEYS
+        
+        y_pred_cv = _quick_model_cv5(model_key, X_tr_cv, y_tr_cv, X_te_cv, 
+                                     use_focal=use_focal, use_class_weight=use_cw)
         if y_pred_cv is not None:
             _fill_col(COL_CV5, y_pred_cv)
             _, _, mf1_cv, _ = precision_recall_fscore_support(
                 y_te_enc, y_pred_cv, average="macro", zero_division=0)
             _info(f"  {model_name} {COL_CV5:30s} → 5-Fold CV, MacroF1={mf1_cv:.4f} ({time.time()-t0:.1f}s)")
         else:
-            if prev_col is not None:
-                df[COL_CV5] = df[prev_col]
+            df[COL_CV5] = df[COL_COST_ADJ]
             _info(f"  {model_name} {COL_CV5}: 5-Fold CV başarısız")
     elif prev_col is not None:
-        df[COL_CV5] = df[prev_col]
-        _info(f"  {model_name} {COL_CV5}: SMOTE verisi yok, '{prev_col}' kopyalandı")
-
-    # ── Focal Loss sütunları (XGB / LGBM) ─────────────────────────────────
-    if model_key in FOCAL_LOSS_KEYS:
-        smote_data = stages.get(COL_SMOTE) or stages.get(COL_TOMEK) or stages.get(COL_ENH)
-        if smote_data is not None:
-            X_sm, y_sm, X_te_fl, _ = smote_data
-            n_cls_count = len(classes)
-
-            # Standart loss
-            t0 = time.time()
-            m_std = _quick_model(model_key, X_sm, y_sm)
-            if m_std is not None:
-                yhat_std = _predict(m_std, X_te_fl)
-                _fill_col(COL_STD_LOSS, yhat_std)
-                _, _, mf1, _ = precision_recall_fscore_support(
-                    y_te_enc, yhat_std, average="macro", zero_division=0)
-                _info(f"  {model_name} {COL_STD_LOSS:30s} → MacroF1={mf1:.4f} ({time.time()-t0:.1f}s)")
-
-            # Focal loss
-            t0 = time.time()
-            m_fl, needs_sm = _quick_model_with_focal(model_key, X_sm, y_sm, n_cls_count)
-            if m_fl is not None:
-                yhat_fl = _predict_focal(m_fl, X_te_fl, needs_sm)
-                _fill_col(COL_FOCAL, yhat_fl)
-                _, _, mf1, _ = precision_recall_fscore_support(
-                    y_te_enc, yhat_fl, average="macro", zero_division=0)
-                _info(f"  {model_name} {COL_FOCAL:30s} → MacroF1={mf1:.4f} ({time.time()-t0:.1f}s)")
+        df[COL_CV5] = df[COL_COST_ADJ]
+        _info(f"  {model_name} {COL_CV5}: SMOTE verisi yok, '{COL_COST_ADJ}' kopyalandı")
 
     return df
 
@@ -762,7 +735,7 @@ def build_model_table(model_key, model_name, cdir, classes, yte_enc,
     n_cls = len(classes)
 
     # Hangi sütunlar bu model için geçerli
-    model_cols = ALL_COLS + (FOCAL_LOSS_COLS if model_key in FOCAL_LOSS_KEYS else [])
+    model_cols = ALL_COLS
 
     # Satir indeksi: her sinif icin 3 satir + 4 genel
     row_index = []
@@ -869,55 +842,62 @@ def build_model_table(model_key, model_name, cdir, classes, yte_enc,
                 _info(f"{model_name} {col} → bos, '{prev}' ile dolduruldu")
             prev = col
 
-    # ── 5-Fold CV sütunu ──────────────────────────────────────────
+    # ── 6. Focal / Class Weight Sütunu ────────────────────────────
+    # SMOTE sonrasi veriyi yeniden uret (en son resampling adimi)
+    X_base = Xt_tr_enh if Xt_tr_enh is not None else Xt_tr_raw
+    X_te   = Xt_te_enh if Xt_te_enh is not None else Xt_te_raw
+
+    if not skip_resampling:
+        configs_fl = build_resampling_configs(X_base, y_tr_enc)
+        # Son config SMOTE sonrasi veri
+        X_smote, y_smote = X_base, y_tr_enc
+        for lbl, Xc, yc in configs_fl:
+            if lbl == COL_SMOTE:
+                X_smote, y_smote = Xc, yc
+    else:
+        X_smote, y_smote = X_base, y_tr_enc
+
+    n_cls_count = len(classes)
     t0 = time.time()
-    y_pred_cv5 = _quick_model_cv5(model_key, X_cv_data, y_cv_data, X_te)
+
+    if model_key in FOCAL_LOSS_KEYS:
+        m_fl, needs_softmax = _quick_model_with_focal(model_key, X_smote, y_smote, n_cls_count)
+        if m_fl is not None:
+            yhat_fl = _predict_focal(m_fl, X_te, needs_softmax)
+            _fill_col(COL_COST_ADJ, yhat_fl)
+            _, _, mf1, _ = precision_recall_fscore_support(
+                yte_enc, yhat_fl, average="macro", zero_division=0)
+            _info(f"{model_name} {COL_COST_ADJ:30s} → Focal Loss, MacroF1={mf1:.4f}  ({time.time()-t0:.1f}s)")
+        else:
+            df[COL_COST_ADJ] = df[COL_SMOTE]
+            _info(f"{model_name} {COL_COST_ADJ}: Focal Loss basarisiz, kopyalandi")
+    else:
+        m_cw = _quick_model(model_key, X_smote, y_smote, use_class_weight=True)
+        if m_cw is not None:
+            yhat_cw = _predict(m_cw, X_te)
+            _fill_col(COL_COST_ADJ, yhat_cw)
+            _, _, mf1, _ = precision_recall_fscore_support(
+                yte_enc, yhat_cw, average="macro", zero_division=0)
+            _info(f"{model_name} {COL_COST_ADJ:30s} → Class Weight, MacroF1={mf1:.4f}  ({time.time()-t0:.1f}s)")
+        else:
+            df[COL_COST_ADJ] = df[COL_SMOTE]
+            _info(f"{model_name} {COL_COST_ADJ}: Class Weight basarisiz, kopyalandi")
+
+    # ── 7. 5-Fold CV sütunu ──────────────────────────────────────────
+    t0 = time.time()
+    use_focal = model_key in FOCAL_LOSS_KEYS
+    use_cw = model_key not in FOCAL_LOSS_KEYS
+    
+    y_pred_cv5 = _quick_model_cv5(model_key, X_cv_data, y_cv_data, X_te,
+                                  use_focal=use_focal, use_class_weight=use_cw)
     if y_pred_cv5 is not None:
         _fill_col(COL_CV5, y_pred_cv5)
         _, _, mf1_cv, _ = precision_recall_fscore_support(
             yte_enc, y_pred_cv5, average="macro", zero_division=0)
         _info(f"{model_name} {COL_CV5:30s} → 5-Fold CV, MacroF1={mf1_cv:.4f} ({time.time()-t0:.1f}s)")
     else:
-        df[COL_CV5] = df[COL_SMOTE]
-        _info(f"{model_name} {COL_CV5}: 5-Fold CV başarısız, '{COL_SMOTE}' kopyalandı")
-
-    # ── Focal Loss sütunlari (sadece XGB ve LGBM) ────────────────
-    if model_key in FOCAL_LOSS_KEYS:
-        # SMOTE sonrasi veriyi yeniden uret (en son resampling adimi)
-        X_base = Xt_tr_enh if Xt_tr_enh is not None else Xt_tr_raw
-        X_te   = Xt_te_enh if Xt_te_enh is not None else Xt_te_raw
-
-        if not skip_resampling:
-            configs_fl = build_resampling_configs(X_base, y_tr_enc)
-            # Son config SMOTE sonrasi veri
-            X_smote, y_smote = X_base, y_tr_enc
-            for lbl, Xc, yc in configs_fl:
-                if lbl == COL_SMOTE:
-                    X_smote, y_smote = Xc, yc
-        else:
-            X_smote, y_smote = X_base, y_tr_enc
-
-        n_cls_count = len(classes)
-
-        # +SMOTE + Standart Loss
-        t0 = time.time()
-        m_std = _quick_model(model_key, X_smote, y_smote)
-        if m_std is not None:
-            yhat_std = _predict(m_std, X_te)
-            _fill_col(COL_STD_LOSS, yhat_std)
-            _, _, mf1, _ = precision_recall_fscore_support(
-                yte_enc, yhat_std, average="macro", zero_division=0)
-            _info(f"{model_name} {COL_STD_LOSS:30s} → MacroF1={mf1:.4f}  ({time.time()-t0:.1f}s)")
-
-        # +SMOTE + Focal Loss
-        t0 = time.time()
-        m_fl, needs_softmax = _quick_model_with_focal(model_key, X_smote, y_smote, n_cls_count)
-        if m_fl is not None:
-            yhat_fl = _predict_focal(m_fl, X_te, needs_softmax)
-            _fill_col(COL_FOCAL, yhat_fl)
-            _, _, mf1, _ = precision_recall_fscore_support(
-                yte_enc, yhat_fl, average="macro", zero_division=0)
-            _info(f"{model_name} {COL_FOCAL:30s} → MacroF1={mf1:.4f}  ({time.time()-t0:.1f}s)")
+        df[COL_CV5] = df[COL_COST_ADJ]
+        _info(f"{model_name} {COL_CV5}: 5-Fold CV başarısız, '{COL_COST_ADJ}' kopyalandı")
 
     return df
 

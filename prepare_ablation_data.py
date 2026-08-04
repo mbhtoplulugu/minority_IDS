@@ -40,7 +40,7 @@ from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, RobustScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
-from imblearn.under_sampling import RandomUnderSampler, TomekLinks
+from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import SMOTE
 
 warnings.filterwarnings("ignore")
@@ -542,39 +542,13 @@ def run_stages(X_tr_raw: np.ndarray, X_te_raw: np.ndarray,
                ds_name, "stage_C_rus", "B + RandomUnderSampler",
                X_tr_rus, y_tr_rus, X_te_final, y_te, le, enh_names)
 
-    # ── Aşama D: Tomek (stratejiye göre) ─────────────────────────────────────
-    _info(f"[{ds_name}] Aşama D: Tomek ({strategy})")
-    vc_d = pd.Series(y_tr_rus).value_counts()
-    min_cls_d = int(vc_d.min())
-
-    if strategy == "rus_only":
-        # Tomek yok — C'yi kopyala
-        _info(f"  Tomek atlandı (strateji=rus_only), C kopyalanıyor")
-        X_tr_tomek, y_tr_tomek = X_tr_rus.copy(), y_tr_rus.copy()
-        tomek_desc = "C kopyası (rus_only stratejisi)"
-
-    elif strategy in ("rus_smote", "pipeline_replica"):
-        # Tomek: sadece majority sınıfı temizle, <50 örnekli sınıf varsa atla
-        TOMEK_MIN_CLS = 50
-        if min_cls_d < TOMEK_MIN_CLS:
-            _info(f"  Tomek atlandı (min sınıf={min_cls_d} < {TOMEK_MIN_CLS}), C kopyalanıyor")
-            X_tr_tomek, y_tr_tomek = X_tr_rus.copy(), y_tr_rus.copy()
-            tomek_desc = f"C kopyası (min_cls={min_cls_d} < {TOMEK_MIN_CLS})"
-        else:
-            tl = TomekLinks(sampling_strategy="majority", n_jobs=-1)
-            X_tr_tomek, y_tr_tomek = tl.fit_resample(X_tr_rus, y_tr_rus)
-            tomek_desc = "C + Tomek(majority only)"
-            _info(f"  Tomek(majority): {len(y_tr_rus):,} → {len(y_tr_tomek):,}")
-
-    else:  # "full"
-        if min_cls_d < 20:
-            _info(f"  TomekLinks atlandı (min sınıf={min_cls_d} < 20), C kopyalanıyor")
-            X_tr_tomek, y_tr_tomek = X_tr_rus.copy(), y_tr_rus.copy()
-            tomek_desc = "C kopyası (min_cls<20)"
-        else:
-            tl = TomekLinks(sampling_strategy="not minority", n_jobs=-1)
-            X_tr_tomek, y_tr_tomek = tl.fit_resample(X_tr_rus, y_tr_rus)
-            tomek_desc = "C + Tomek(not_minority)"
+    # ── Aşama D: Tomek — KALDIRILDI ─────────────────────────────────────────
+    # Ablasyon analizi, Tomek Links'in nadir sinif orneklerini silerek
+    # tum stratejilerde sistematik zarar verdigini gostermistir.
+    # Stage D artik C'nin kopyasidir; sinif tutarliligi korunur.
+    _info(f"[{ds_name}] Aşama D: Tomek kaldırıldı — C kopyalanıyor")
+    X_tr_tomek, y_tr_tomek = X_tr_rus.copy(), y_tr_rus.copy()
+    tomek_desc = "C kopyası (Tomek kalıcı olarak kaldırıldı)"
 
     save_stage(out_path / "stage_D_tomek",
                ds_name, "stage_D_tomek", tomek_desc,

@@ -9,7 +9,7 @@ ablation_ensemble_analysis.py  —  Ensemble Kademeli Ablation Analizi
 
 Her sütunda sinif bazli Precision, Recall, F1 + genel Accuracy, Macro F1 raporlanir.
 
-Kullanim:
+Kullanim:;
   python ablation_ensemble_analysis.py --cache-dir unsw cicids14
   python ablation_ensemble_analysis.py --cache-dir unsw --output-dir ablation_results/ensemble
 """
@@ -107,7 +107,7 @@ def compute_default_ensemble(cdir, classes):
     Hicbir uzman, esik veya otonom mekanizma yok.
     """
     P_sum = None
-    model_count = 0
+    model_count = 04
 
     for m_key in MAIN_MODELS:
         path = cdir / f'proba_{m_key}_oof_test.npz'

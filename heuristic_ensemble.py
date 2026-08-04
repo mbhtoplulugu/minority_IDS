@@ -29,6 +29,127 @@ def get_f1_arr(y_true, y_pred_encoded, n_cls):
         y_true, y_pred_encoded, labels=range(n_cls), zero_division=0)
     return f1
 
+
+def _apply_correction_boost(P_base, P_expert, c_idx, threshold, alpha=0.30):
+    """Temel ensemble yanlış sınıf seçmişken, uzman yüksek güvenle doğru sınıfı işaret ediyorsa onu düzeltir."""
+    if P_base is None or P_expert is None:
+        return P_base
+
+    expert_conf = P_expert[:, c_idx]
+    base_pred = np.argmax(P_base, axis=1)
+    mask = (base_pred != c_idx) & (expert_conf >= threshold)
+    if not np.any(mask):
+        return P_base
+
+    boosted = np.array(P_base, copy=True, dtype=np.float32)
+    boosted[mask, c_idx] = np.maximum(
+        boosted[mask, c_idx],
+        np.minimum(0.999, (1.0 - alpha) * boosted[mask, c_idx] + alpha * expert_conf[mask])
+    )
+
+    row_sums = boosted[mask].sum(axis=1, keepdims=True)
+    row_sums[row_sums <= 0] = 1.0
+    boosted[mask] = boosted[mask] / row_sums
+    return boosted
+
+
+def _dynamic_macro_tol(class_freq: float, base_tol: float = 0.001) -> float:
+    """
+    Sinif frekansina gore kabul edilebilir Macro F1 dusus toleransini hesaplar.
+    Nadir siniflar (dusuk frekans) daha buyuk tolerans alir cunku
+    o sinifin katkisi Macro F1'e matematiksel olarak sinirlidir.
+
+    freq < 0.001  -> 0.05  (heartbleed, web_attack_sql gibi <1000 ornek)
+    freq < 0.010  -> 0.02  (web_attack_brute, web_attack_xss gibi <10k ornek)
+    freq >= 0.010 -> base_tol (0.001 — buyuk siniflar icin siki)
+    """
+    if class_freq < 0.001:
+        return 0.05
+    elif class_freq < 0.010:
+        return 0.02
+    else:
+        return base_tol
+
+
+def _adaptive_prec_threshold(prec_base_val: float) -> float:
+    """
+    Sinifin mevcut precision degerine gore kabul edilebilir minimum
+    precision esigini hesaplar.
+
+    Dusuk precision siniflar (< 0.50) : mutlak 0.03 dusus izni
+    Orta  precision siniflar (0.50-0.90): %5 goreceli dusus izni
+    Yuksek precision siniflar (> 0.90) : %1 goreceli dusus izni
+    """
+    if prec_base_val < 0.50:
+        return max(prec_base_val - 0.03, 0.0)
+    elif prec_base_val < 0.90:
+        return prec_base_val * 0.95
+    else:
+        return prec_base_val * 0.99
+
+
+def _expert_accepted(
+    y_true: np.ndarray,
+    base_preds: np.ndarray,
+    new_preds: np.ndarray,
+    c_idx: int,
+    prec_base_arr: np.ndarray,
+    f1_base_arr: np.ndarray,
+    n_cls: int,
+    class_freq: float = 0.01,
+    label: str = "",
+) -> bool:
+    """
+    Expert katki kabul kriteri — 4 kosul:
+
+    1. Hedef sinif F1 artmali (veya esit kalmali).
+    2. Genel Macro F1 dusmesin — tolerans sinif frekansina gore dinamik.
+       Nadir siniflar (freq<0.001) icin 0.05, az siniflar icin 0.02,
+       buyuk siniflar icin 0.001.
+    3. Hedef sinifin precision degeri adaptif esigi saglamali.
+    4. Hicbir sinifin F1'i kendi base degerinin
+       max(0.03, 0.05 * f1_base[j])'dan fazla dusmesin.
+    """
+    prec_new, _, f1_new, _ = precision_recall_fscore_support(
+        y_true, new_preds, labels=range(n_cls), zero_division=0)
+
+    macro_base = float(np.mean(f1_base_arr))
+    macro_new  = float(np.mean(f1_new))
+    macro_tol  = _dynamic_macro_tol(class_freq)
+
+    # Kosul 1
+    if f1_new[c_idx] < f1_base_arr[c_idx] - 1e-6:
+        _info(f"    [{label}] RED — Kosul1: hedef F1 dusus "
+              f"{f1_base_arr[c_idx]:.4f} -> {f1_new[c_idx]:.4f}")
+        return False
+
+    # Kosul 2 — dinamik tolerans
+    if macro_new < macro_base - macro_tol:
+        _info(f"    [{label}] RED — Kosul2: Macro F1 dusus "
+              f"{macro_base:.4f} -> {macro_new:.4f} (tol={macro_tol:.3f})")
+        return False
+
+    # Kosul 3
+    min_prec = _adaptive_prec_threshold(float(prec_base_arr[c_idx]))
+    if prec_new[c_idx] < min_prec:
+        _info(f"    [{label}] RED — Kosul3: hedef precision "
+              f"{prec_base_arr[c_idx]:.4f} -> {prec_new[c_idx]:.4f} "
+              f"(esik={min_prec:.4f})")
+        return False
+
+    # Kosul 4
+    for j in range(n_cls):
+        delta_tol = max(0.03, 0.05 * float(f1_base_arr[j]))
+        if f1_new[j] < f1_base_arr[j] - delta_tol:
+            _info(f"    [{label}] RED — Kosul4: sinif[{j}] F1 dusus "
+                  f"{f1_base_arr[j]:.4f} -> {f1_new[j]:.4f} "
+                  f"(tol={delta_tol:.4f})")
+            return False
+
+    _info(f"    [{label}] KABUL — hedef F1 {f1_base_arr[c_idx]:.4f} -> {f1_new[c_idx]:.4f}, "
+          f"Macro {macro_base:.4f} -> {macro_new:.4f} (tol={macro_tol:.3f})")
+    return True
+
 # ── Yardimci metrik fonksiyonlari ────────────────────────────────────────────
 
 def _model_scalar_metrics(y_true, y_pred):
@@ -354,10 +475,16 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
                 weight_sum_te += w
     weight_sum_te[weight_sum_te == 0] = 1e-9
     P_soft_te /= weight_sum_te
-    yhat_te = P_soft_te.argmax(axis=1)
 
-    # --- 3. Surgical & Fast Expert Overrides ---
-    _stage("Applying Autonomous Surgical Overrides (Validation-Gated)")
+    # --- 2b. Uncertainty-aware expert boost (class-wise) ---
+    _stage("Applying Uncertainty-Aware Expert Boosts")
+    base_val_preds = P_soft_val.argmax(axis=1)
+    prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+        yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
+
+    # Sinif frekanslarini hesapla (dinamik tolerans icin)
+    vc = np.bincount(yv_enc, minlength=n_cls)
+    freq_arr = vc / max(vc.sum(), 1)
 
     for expert_proba_path in sorted(cdir.glob('proba_surgical_*_oof_test.npz')):
         cls_name = (expert_proba_path.stem
@@ -366,35 +493,30 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
                     .replace('_expert', ''))
         if cls_name not in classes:
             continue
-        thresh_path    = cdir / f'surgical_{cls_name}_threshold.pkl'
         proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
+        if not proba_val_path.exists():
+            continue
         c_idx = int(np.where(classes == cls_name)[0][0])
-        apply_override = True
+        thresh_path = cdir / f'surgical_{cls_name}_threshold.pkl'
+        opt_thresh = pickle.load(open(thresh_path, 'rb')) if thresh_path.exists() else 0.5
+        threshold = float(opt_thresh)
 
-        if proba_val_path.exists():
-            P_surg_val = _load_aligned(proba_val_path, classes)
-            with open(thresh_path, 'rb') as f:
-                opt_thresh = pickle.load(f)
-            temp_val = base_val_preds.copy()
-            temp_val[P_surg_val[:, c_idx] >= opt_thresh] = c_idx
-            prec_base, _, f1_base, _ = precision_recall_fscore_support(
-                yv_enc, base_val_preds, average=None, zero_division=0)
-            prec_new, _, f1_new, _ = precision_recall_fscore_support(
-                yv_enc, temp_val, average=None, zero_division=0)
-            if not (f1_new[c_idx] > f1_base[c_idx] and
-                    np.all(prec_new >= 0.97 * prec_base)):
-                _info(f"  -> {cls_name}: Surgical BYPASSED")
-                apply_override = False
+        P_surg_val = _load_aligned(proba_val_path, classes)
+        temp_val = _apply_correction_boost(P_soft_val, P_surg_val, c_idx, threshold, alpha=0.35)
+        temp_val_preds = temp_val.argmax(axis=1)
 
-        if apply_override:
-            with open(thresh_path, 'rb') as f:
-                opt_thresh = pickle.load(f)
-            P_surg = _load_aligned(expert_proba_path, classes)
-            mask = P_surg[:, c_idx] >= opt_thresh
-            if mask.sum() > 0:
-                yhat_te[mask] = c_idx
-                _info(f"  -> SURGICAL: {cls_name} overrode {int(mask.sum())} "
-                      f"(thresh={opt_thresh:.3f})")
+        if _expert_accepted(yv_enc, base_val_preds, temp_val_preds, c_idx,
+                            prec_base_arr, f1_base_arr, n_cls,
+                            class_freq=float(freq_arr[c_idx]),
+                            label=f"BOOST surgical/{cls_name}"):
+            P_soft_val    = temp_val
+            base_val_preds = P_soft_val.argmax(axis=1)
+            prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+                yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
+            P_soft_te = _apply_correction_boost(
+                P_soft_te,
+                _load_aligned(expert_proba_path, classes),
+                c_idx, threshold, alpha=0.35)
 
     for expert_val_path in sorted(cdir.glob('proba_fast_expert_*_oof_valid.npz')):
         cls_name = (expert_val_path.stem
@@ -408,26 +530,99 @@ def heuristic_ensemble(cache_dir: str, exclude_weak: bool = False):
         c_idx = int(np.where(classes == cls_name)[0][0])
         thresh_path = cdir / f'fast_threshold_{cls_name}.pkl'
         opt_thresh = pickle.load(open(thresh_path, 'rb')) if thresh_path.exists() else 0.5
-        _info(f"  -> {cls_name}: thresh={opt_thresh:.3f}")
+        threshold = float(opt_thresh)
+
+        P_fe_val = _load_aligned(expert_val_path, classes)
+        temp_val = _apply_correction_boost(P_soft_val, P_fe_val, c_idx, threshold, alpha=0.20)
+        temp_val_preds = temp_val.argmax(axis=1)
+
+        if _expert_accepted(yv_enc, base_val_preds, temp_val_preds, c_idx,
+                            prec_base_arr, f1_base_arr, n_cls,
+                            class_freq=float(freq_arr[c_idx]),
+                            label=f"BOOST fast/{cls_name}"):
+            P_soft_val    = temp_val
+            base_val_preds = P_soft_val.argmax(axis=1)
+            prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+                yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
+            P_soft_te = _apply_correction_boost(
+                P_soft_te,
+                _load_aligned(expert_test_path, classes),
+                c_idx, threshold, alpha=0.20)
+
+    base_val_preds = P_soft_val.argmax(axis=1)
+    yhat_te = P_soft_te.argmax(axis=1)
+
+    # --- 3. Surgical & Fast Expert Overrides ---
+    _stage("Applying Autonomous Surgical Overrides (Validation-Gated)")
+    base_val_preds = P_soft_val.argmax(axis=1)
+    prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+        yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
+
+    for expert_proba_path in sorted(cdir.glob('proba_surgical_*_oof_test.npz')):
+        cls_name = (expert_proba_path.stem
+                    .replace('proba_surgical_', '')
+                    .replace('_oof_test', '')
+                    .replace('_expert', ''))
+        if cls_name not in classes:
+            continue
+        thresh_path    = cdir / f'surgical_{cls_name}_threshold.pkl'
+        proba_val_path = cdir / f'proba_surgical_{cls_name}_oof_valid.npz'
+        if not proba_val_path.exists():
+            continue
+        c_idx = int(np.where(classes == cls_name)[0][0])
+
+        with open(thresh_path, 'rb') as f:
+            opt_thresh = pickle.load(f)
+
+        P_surg_val = _load_aligned(proba_val_path, classes)
+        temp_val = base_val_preds.copy()
+        temp_val[P_surg_val[:, c_idx] >= opt_thresh] = c_idx
+
+        if _expert_accepted(yv_enc, base_val_preds, temp_val, c_idx,
+                            prec_base_arr, f1_base_arr, n_cls,
+                            class_freq=float(freq_arr[c_idx]),
+                            label=f"OVERRIDE surgical/{cls_name}"):
+            P_surg_te = _load_aligned(expert_proba_path, classes)
+            mask = P_surg_te[:, c_idx] >= opt_thresh
+            if mask.sum() > 0:
+                yhat_te[mask] = c_idx
+                _info(f"  -> SURGICAL OVERRIDE: {cls_name} "
+                      f"{int(mask.sum())} ornek (thresh={opt_thresh:.3f})")
+            base_val_preds = temp_val
+            prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+                yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
+
+    for expert_val_path in sorted(cdir.glob('proba_fast_expert_*_oof_valid.npz')):
+        cls_name = (expert_val_path.stem
+                    .replace('proba_fast_expert_', '')
+                    .replace('_oof_valid', ''))
+        if cls_name not in classes:
+            continue
+        expert_test_path = cdir / f'proba_fast_expert_{cls_name}_oof_test.npz'
+        if not expert_test_path.exists():
+            continue
+        c_idx = int(np.where(classes == cls_name)[0][0])
+        thresh_path = cdir / f'fast_threshold_{cls_name}.pkl'
+        opt_thresh = pickle.load(open(thresh_path, 'rb')) if thresh_path.exists() else 0.5
+        _info(f"  Degerlendir: {cls_name} (thresh={opt_thresh:.3f})")
 
         P_fe_val = _load_aligned(expert_val_path, classes)
         temp_val = base_val_preds.copy()
         temp_val[P_fe_val[:, c_idx] >= opt_thresh] = c_idx
-        prec_base, _, f1_base, _ = precision_recall_fscore_support(
-            yv_enc, base_val_preds, average=None, zero_division=0)
-        prec_new, _, f1_new, _ = precision_recall_fscore_support(
-            yv_enc, temp_val, average=None, zero_division=0)
 
-        if not (f1_new[c_idx] > f1_base[c_idx] and
-                np.all(prec_new >= 0.97 * prec_base)):
-            _info(f"  -> {cls_name}: Fast expert BYPASSED")
-            continue
-
-        P_fe_te = _load_aligned(expert_test_path, classes)
-        mask = P_fe_te[:, c_idx] >= opt_thresh
-        if mask.sum() > 0:
-            yhat_te[mask] = c_idx
-            _info(f"  -> FAST EXPERT: {cls_name} overrode {int(mask.sum())}")
+        if _expert_accepted(yv_enc, base_val_preds, temp_val, c_idx,
+                            prec_base_arr, f1_base_arr, n_cls,
+                            class_freq=float(freq_arr[c_idx]),
+                            label=f"OVERRIDE fast/{cls_name}"):
+            P_fe_te = _load_aligned(expert_test_path, classes)
+            mask = P_fe_te[:, c_idx] >= opt_thresh
+            if mask.sum() > 0:
+                yhat_te[mask] = c_idx
+                _info(f"  -> FAST OVERRIDE: {cls_name} "
+                      f"{int(mask.sum())} ornek (thresh={opt_thresh:.3f})")
+            base_val_preds = temp_val
+            prec_base_arr, _, f1_base_arr, _ = precision_recall_fscore_support(
+                yv_enc, base_val_preds, labels=range(n_cls), zero_division=0)
 
     # --- FINAL ---
     f1s_ens  = get_f1_arr(yte_enc, yhat_te, n_cls)

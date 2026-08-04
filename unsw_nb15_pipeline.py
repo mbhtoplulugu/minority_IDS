@@ -194,9 +194,10 @@ def apply_smart_resampling(X: np.ndarray, y, cfg: Config):
     """
     Akll Resampling: Dev snflar RAM snrlarna (max 300k) gre undersample,
     Ar kk snflar ise SMOTE ile makul bir boyuta (min 5k) oversample yapar.
-    Yeni: Tomek Links ile Normal vs Fuzzers snrn temizler.
+    Not: TomekLinks kaldirildi — ablasyon analizi Tomek'in nadir sinif
+    orneklerini silerek sistematik zarar verdigini gostermistir.
     """
-    from imblearn.under_sampling import RandomUnderSampler, TomekLinks
+    from imblearn.under_sampling import RandomUnderSampler
     from imblearn.over_sampling import SMOTE
     y = _as_series(y)
     X = _as_array(X)
@@ -212,13 +213,8 @@ def apply_smart_resampling(X: np.ndarray, y, cfg: Config):
     y_res = _as_series(y_res)
     _print_dist('train.after_undersample', y_res)
 
-    # 2. Tomek Links (Boundary Cleaning - Normal vs Fuzzers/Exploits)
-    # Bu adm akan rnekleri (noise) temizleyerek daha net snrlar oluturur.
-    _info("Tomek Links ile snr temizlii yaplyor (Normal vs others)...")
-    tl = TomekLinks(sampling_strategy='majority', n_jobs=-1)
-    X_res, y_res = tl.fit_resample(X_res, y_res)
-    y_res = _as_series(y_res)
-    _print_dist('train.after_tomek', y_res)
+    # 2. Tomek Links kaldirildi — ablasyon analizi nadir sinif orneklerini
+    # silerek sistematik zarar verdigini gostermistir (bkz. ablation_study).
     X_final, y_final = X_res, y_res
     # 3. Oversample (Ar kkleri ykselt)
     min_samples = 8000
